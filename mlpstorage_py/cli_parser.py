@@ -19,6 +19,7 @@ from mlpstorage_py.cli import (
     add_training_arguments,
     add_checkpointing_arguments,
     add_vectordb_arguments,
+    add_kvcache_arguments,
     add_reports_arguments,
     add_history_arguments,
     add_lockfile_arguments,
@@ -56,6 +57,11 @@ def parse_arguments():
         description=PROGRAM_DESCRIPTIONS['vectordb'],
         help="VectorDB benchmark options"
     )
+    kvcache_parsers = sub_programs.add_parser(
+        "kvcache",
+        description=PROGRAM_DESCRIPTIONS['kvcache'],
+        help="KV Cache benchmark options"
+    )
     reports_parsers = sub_programs.add_parser(
         "reports",
         description=PROGRAM_DESCRIPTIONS.get('reports', ''),
@@ -76,6 +82,7 @@ def parse_arguments():
         'training': training_parsers,
         'checkpointing': checkpointing_parsers,
         'vectordb': vectordb_parsers,
+        'kvcache': kvcache_parsers,
         'reports': reports_parsers,
         'history': history_parsers,
         'lockfile': lockfile_parsers,
@@ -85,6 +92,7 @@ def parse_arguments():
     add_training_arguments(training_parsers)
     add_checkpointing_arguments(checkpointing_parsers)
     add_vectordb_arguments(vectordb_parsers)
+    add_kvcache_arguments(kvcache_parsers)
     add_reports_arguments(reports_parsers)
     add_history_arguments(history_parsers)
     add_lockfile_arguments(lockfile_parsers)
@@ -227,11 +235,11 @@ def update_args(args):
             args.runtime = VECTORDB_DEFAULT_RUNTIME  # Default runtime if not provided
 
     # Check for list of lists in params and flatten them
-    if args.params:
+    if hasattr(args, 'params') and args.params:
         flattened_params = [item for sublist in args.params for item in sublist]
         setattr(args, 'params', flattened_params)
 
-    if args.mpi_params:
+    if hasattr(args, 'mpi_params') and args.mpi_params:
         flattened_mpi_params = [item for sublist in args.mpi_params for item in sublist]
         setattr(args,'mpi_params', flattened_mpi_params)
 

@@ -7,6 +7,7 @@ name = "mlpstorage"
 version = "3.0"
 description = "MLPerf Storage Benchmark Suite"
 readme = "README.md"
+license = {text = "Apache-2.0"}
 authors = [
     {name = "MLCommons Storage Working Group"}
 ]
@@ -31,13 +32,19 @@ test = [
 full = [
     "dlio-benchmark",
 ]
+vectordb = [
+    "pymilvus>=2.4.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "tabulate>=0.9",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/mlcommons/storage"
 "Bug Tracker" = "https://github.com/mlcommons/storage/issues"
 
 [tool.setuptools]
-packages = {find = {}}
+packages = {find = {include = ["mlpstorage_py*", "vdbbench*"]}}
 
 [tool.setuptools.package-data]
 "mlpstorage_py" = ["../configs/dlio/workload/*.yaml"]

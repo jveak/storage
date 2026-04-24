@@ -166,6 +166,11 @@ def generate_output_location(benchmark, datetime_str=None, **kwargs) -> str:
         output_location = os.path.join(output_location, benchmark.args.command)
         output_location = os.path.join(output_location, datetime_str)
 
+    elif benchmark.BENCHMARK_TYPE == BENCHMARK_TYPES.kv_cache:
+        output_location = os.path.join(output_location, benchmark.BENCHMARK_TYPE.name)
+        output_location = os.path.join(output_location, benchmark.args.command)
+        output_location = os.path.join(output_location, datetime_str)
+
     elif benchmark.BENCHMARK_TYPE == BENCHMARK_TYPES.checkpointing:
         if not hasattr(benchmark.args, "model"):
             raise ValueError("Model name is required for checkpointing benchmark output location")

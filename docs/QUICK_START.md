@@ -35,16 +35,18 @@ Uses the [DLIO benchmark](https://github.com/argonne-lcf/dlio_benchmark) to simu
 # Generate data
 mlpstorage training datagen \
   --model resnet50 \
-  --params storage.storage_type=local \
-  --params storage.storage_root=/tmp/mlperf-test/resnet50
+  --file \
+  --num-processes 4 \
+  --data-dir /tmp/mlperf-test/resnet50
 
 # Run
 mlpstorage training run \
   --model resnet50 \
   --accelerator-type h100 \
-  --num-processes 4 \
-  --params storage.storage_type=local \
-  --params storage.storage_root=/tmp/mlperf-test/resnet50
+  --num-accelerators 4 \
+  --client-host-memory-in-gb 64 \
+  --file \
+  --data-dir /tmp/mlperf-test/resnet50
 ```
 
 ### S3 Object Storage

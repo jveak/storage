@@ -404,6 +404,71 @@ class TestWriteClusterInfo:
             cluster_info_file = tmp_path / "training_cluster_info.json"
             assert not cluster_info_file.exists()
 
+# =============================================================================
+# Tests for VectorDB Single Node 
+# =============================================================================
+
+class TestVectorDBBenchmark:
+    """Tests for VectorDBBenchmark single-node integration."""
+
+    def test_constructor_accepts_kwargs(self, mock_logger):
+        """VectorDBBenchmark must accept run_datetime and logger kwargs
+        because main.py passes them (line 216)."""
+        from mlpstorage_py.benchmarks.vectordbbench import VectorDBBenchmark
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(
+            command='datasize',
+            config='default',
+            debug=False,
+            verbose=False,
+            stream_log_level='INFO',
+            results_dir='/tmp/test',
+            what_if=False,
+            dimension=1536,
+            num_vectors=1_000_000,
+            index_type='DISKANN',
+            num_shards=1,
+            vector_dtype='FLOAT_VECTOR',
+        )
+
+        with patch.object(VectorDBBenchmark, 'verify_benchmark'):
+            # This must NOT raise TypeError about unexpected kwargs
+            bench = VectorDBBenchmark(
+                args,
+                run_datetime="20260415_120000",
+                logger=mock_logger,
+            )
+            assert bench.command == 'datasize'
+            assert bench.config_name == 'default'
+
+    def test_datasize_does_not_require_pymilvus(self, mock_logger):
+        """datasize command should skip dependency validation."""
+        from mlpstorage_py.benchmarks.vectordbbench import VectorDBBenchmark
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(
+            command='datasize',
+            config='default',
+            debug=False,
+            verbose=False,
+            stream_log_level='INFO',
+            results_dir='/tmp/test',
+            what_if=False,
+            dimension=768,
+            num_vectors=5_000_000,
+            index_type='HNSW',
+            num_shards=2,
+            vector_dtype='FLOAT_VECTOR',
+        )
+
+        with patch.object(VectorDBBenchmark, 'verify_benchmark'):
+            with patch.object(VectorDBBenchmark, '_validate_vdb_dependencies') as mock_dep:
+                bench = VectorDBBenchmark(args, logger=mock_logger)
+                # _validate_vdb_dependencies should NOT have been called
+                mock_dep.assert_not_called()
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

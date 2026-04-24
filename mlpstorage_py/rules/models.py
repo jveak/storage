@@ -681,7 +681,7 @@ class BenchmarkInstanceExtractor:
             model=getattr(benchmark.args, 'model', None),
             command=getattr(benchmark.args, 'command', None),
             run_datetime=benchmark.run_datetime,
-            num_processes=benchmark.args.num_processes,
+            num_processes=getattr(benchmark.args, 'num_processes', 0),
             parameters=parameters,
             override_parameters=override_parameters,
             system_info=system_info,

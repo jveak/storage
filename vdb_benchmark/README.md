@@ -20,6 +20,23 @@ cd storage/vdb_benchmark
 pip3 install -e ./
 ```
 
+### Installation via mlpstorage (recommended)
+
+The VDB benchmark is integrated into the MLPerf Storage benchmark suite
+and can be run through the `mlpstorage` CLI. From the repository root:
+
+```bash
+cd storage
+
+# Install with VDB dependencies
+uv sync --extra vectordb
+
+# Also install the vdbbench package into the uv-managed venv
+uv pip install -e ./vdb_benchmark
+```
+
+This makes both `./mlpstorage vectordb` commands and standalone `uv run vdbbench`
+available in the same locked virtual environment.
 ---
 
 ## Deploying a Standalone Milvus Instance
@@ -100,7 +117,31 @@ beec3366bea4   milvusdb/milvus:v2.5.10                    "/tini -- milvus run�
 
 ## Running the Benchmark
 
-The benchmark workflow has three main steps:
+The benchmark workflow has four main steps:
+
+### Step 0 — Estimate Storage Requirements (optional)
+
+Before loading data, estimate how much storage the dataset and index will require:
+
+```bash
+# via mlpstorage
+./mlpstorage vectordb datasize \
+    --dimension 1536 --num-vectors 10000000 \
+    --index-type DISKANN --num-shards 10
+```
+
+This is pure math and does not require a running Milvus instance or pymilvus.
+It reports raw vector data size plus estimated index overhead for DISKANN, HNSW, and AISAQ index types.
+
+Example output:
+
+```
+Vectors:       10,000,000 x dim=1536 x 4B
+Raw data:      61.44 GB
+Index type:    DISKANN (130% overhead)
+Shards:        10
+Estimated total: 798.72 GB
+```
 
 ### Step 1 — Load Vectors
 
@@ -149,6 +190,47 @@ index:
 workflow:
   compact: True
 ```
+#### Via mlpstorage
+
+```bash
+# Load using the default config (1M vectors, 1536-dim, DiskANN)
+./mlpstorage vectordb datagen \
+    --host 127.0.0.1 --port 19530 --config default \
+    --force --results-dir /tmp/vdb_results
+
+# Load using the 10M config
+./mlpstorage vectordb datagen \
+    --host 127.0.0.1 --port 19530 --config 10m \
+    --force --results-dir /tmp/vdb_results
+
+# Override vector count for quick testing
+./mlpstorage vectordb datagen \
+    --host 127.0.0.1 --port 19530 --config default \
+    --num-vectors 50000 --dimension 1536 --num-shards 1 \
+    --force --results-dir /tmp/vdb_results
+```
+
+The `--config` argument refers to YAML files in `configs/vectordbbench/` (without the `.yaml` extension). The `--force` flag drops and recreates
+the collection if it already exists.
+
+> **Important**: When overriding `--dimension` in datagen, the same
+> dimension must match the config used for `run`. Mismatched dimensions
+> between datagen and run cause Milvus to reject queries with a
+> `vector dimension mismatch` error. The safest approach is to create a
+> custom config YAML with the desired dimension and use the same
+> `--config` for both commands.
+
+#### Note: Dimension consistency
+
+The vector dimension must be consistent between data loading and benchmarking. If you override `--dimension` during `datagen`, the config YAML used for `run`
+must specify the same dimension — otherwise Milvus will reject queries with:
+
+```
+vector dimension mismatch, expected vector size(byte) 512, actual 6144
+```
+The safest approach is to use matching `--config` for both `datagen` and `run` without CLI dimension overrides, or to create a dedicated config YAML for
+non-standard dimensions.
+
 
 ### Step 2 — Compact (if needed)
 
@@ -176,14 +258,112 @@ python vdbbench/simple_bench.py \
   --runtime 120
 ```
 
+#### Via mlpstorage
+
+```bash
+# Timed run (default mode, uses simple_bench/vdbbench)
+./mlpstorage vectordb run \
+    --host 127.0.0.1 --port 19530 --config default \
+    --num-query-processes 4 --runtime 120 \
+    --results-dir /tmp/vdb_results
+
+# Query-count mode
+./mlpstorage vectordb run \
+    --host 127.0.0.1 --port 19530 --config default \
+    --num-query-processes 2 --queries 1000 --mode query_count \
+    --results-dir /tmp/vdb_results
+
+# Sweep mode (uses enhanced_bench)
+./mlpstorage vectordb run \
+    --host 127.0.0.1 --port 19530 --config default \
+    --mode sweep --runtime 120 \
+    --results-dir /tmp/vdb_results
+```
+
+The `--mode` parameter controls which benchmark script is invoked:
+
+| Mode | Script | Use case |
+|------|--------|----------|
+| `timed` (default) | `vdbbench` (simple_bench.py) | Fixed-duration sustained load |
+| `query_count` | `vdbbench` (simple_bench.py) | Run exactly N queries |
+| `sweep` | `enhanced-bench` (enhanced_bench.py) | Parameter tuning, recall sweeps |
+
+Results are saved under `--results-dir` in a timestamped subdirectory with
+metadata JSON, per-worker CSV files, recall stats, and disk I/O statistics.
+
+#### History and Reports
+
+```bash
+# View run history
+./mlpstorage history show
+
+# Generate reports from results
+./mlpstorage reports reportgen --results-dir /tmp/vdb_results
+```
 ---
 
+## mlpstorage Quick Reference
+
+The VDB benchmark is integrated into the MLPerf Storage CLI (`./mlpstorage`). All commands below use the `uv run` execution model introduced in PR #308 to
+ensure locked dependencies.
+
+### Available commands
+```
+./mlpstorage vectordb --help
+./mlpstorage vectordb datasize --help
+./mlpstorage vectordb datagen --help
+./mlpstorage vectordb run --help
+```
+### End-to-end example (single node)
+
+```bash
+# 1. Estimate storage
+./mlpstorage vectordb datasize \
+    --dimension 1536 --num-vectors 1000000 --index-type DISKANN
+
+# 2. Load vectors
+./mlpstorage vectordb datagen \
+    --host 127.0.0.1 --port 19530 --config default \
+    --force --results-dir ~/vdb_results
+
+# 3. Run benchmark (2 processes, 60 seconds)
+./mlpstorage vectordb run \
+    --host 127.0.0.1 --port 19530 --config default \
+    --num-query-processes 2 --runtime 60 \
+    --results-dir ~/vdb_results
+
+# 4. View history
+./mlpstorage history show
+```
+
+### Config files
+
+YAML configs live in `configs/vectordbbench/`. The `--config` flag takes the filename without `.yaml`:
+
+| Config | Vectors | Dimension | Shards | Index |
+|--------|---------|-----------|--------|-------|
+| `default` | 1M | 1536 | 1 | DiskANN |
+| `10m` | 10M | 1536 | 10 | DiskANN |
+
+Custom configs can be added to the same directory.
+
+### Preview status
+
+The VDB benchmark is currently in **preview** status. All runs qualify for OPEN category only — closed submissions are not yet accepted. Pass `--open`
+to acknowledge this:
+
+```bash
+./mlpstorage vectordb run --open \
+    --host 127.0.0.1 --config default \
+    --num-query-processes 4 --runtime 120 \
+    --results-dir ~/vdb_results
+```
+
+---
 ## enhanced_bench.py — Full Reference
 
-`enhanced_bench.py` merges **simple_bench** (operational features: FLAT GT auto-creation,
-runtime-based execution, per-worker CSV, full P99.9/P99.99 latency stats) with
-**enhanced_bench** (advanced features: parameter sweep, warm/cold cache regimes, budget mode,
-YAML config, memory estimator). It exposes a single unified command.
+`enhanced_bench.py` merges **simple_bench** (operational features: FLAT GT auto-creation, runtime-based execution, per-worker CSV, full P99.9/P99.99 latency stats) with
+**enhanced_bench** (advanced features: parameter sweep, warm/cold cache regimes, budget mode, YAML config, memory estimator). It exposes a single unified command.
 
 ### Two Execution Paths
 
@@ -198,8 +378,7 @@ The script automatically selects the path based on the flags you provide:
 
 ### Execution Path A — Runtime / Query-Count Mode
 
-Mimics `simple_bench.py`. Runs workers for a fixed duration or query count, writes per-process
-CSV files, and aggregates full latency/recall statistics.
+Mimics `simple_bench.py`. Runs workers for a fixed duration or query count, writes per-process CSV files, and aggregates full latency/recall statistics.
 
 #### Step A-1: Auto-create the FLAT Ground Truth Collection (first run only)
 
@@ -213,8 +392,7 @@ python vdbbench/enhanced_bench.py \
   --processes 1
 ```
 
-This copies all vectors + primary keys from your ANN collection into a new FLAT-indexed
-collection (`<collection>_flat_gt`) and uses it for exact ground-truth recall.  
+This copies all vectors + primary keys from your ANN collection into a new FLAT-indexed collection (`<collection>_flat_gt`) and uses it for exact ground-truth recall.  
 You only need to do this once per collection; subsequent runs reuse the existing FLAT collection.
 
 > **Why FLAT?** DiskANN/HNSW/AISAQ are approximate. FLAT performs brute-force exact search,
@@ -258,6 +436,17 @@ python vdbbench/enhanced_bench.py \
   --processes 8 \
   --output-dir /tmp/bench_results
 ```
+
+#### enhanced_bench.py - Via mlpstorage
+
+> **mlpstorage shortcut**: `enhanced_bench.py` can be invoked through mlpstorage
+> using `--mode sweep`:
+> ```bash
+> ./mlpstorage vectordb run --config default --mode sweep --runtime 120 \
+>     --results-dir ~/vdb_results
+> ```
+> This is equivalent to running `enhanced_bench.py` directly with the config's
+> parameters.
 
 #### Path A — Key Parameters
 
@@ -488,10 +677,19 @@ python vdbbench/enhanced_bench.py \
 - IVF flat/PQ indexes (basic support)
 
 ---
-
 ## Dependencies
 
-Install required Python packages:
+### Via mlpstorage (recommended)
+
+```bash
+# From the repository root
+uv sync --extra vectordb
+uv pip install -e ./vdb_benchmark
+```
+
+This installs all required dependencies into the uv-managed virtual environment.
+
+### Manual installation
 
 ```bash
 pip install pymilvus numpy pyyaml tabulate pandas
@@ -502,9 +700,14 @@ pip install pymilvus numpy pyyaml tabulate pandas
 | `pymilvus` | Milvus client |
 | `numpy` | Vector generation + recall math |
 | `pyyaml` | YAML config support |
-| `tabulate` | Collection info table display (optional) |
-| `pandas` | Full latency statistics aggregation (optional) |
+| `tabulate` | Collection info table display |
+| `pandas` | Full latency statistics aggregation |
 
+> **Note**: The `datasize` command (`./mlpstorage vectordb datasize`) does not
+> require pymilvus or a running Milvus instance — it is pure math. All other
+> commands require pymilvus and a running Milvus server. If dependencies are
+> missing, the benchmark will exit with a clear error listing the missing
+> packages and install instructions.
 ---
 
 ## How Recall Is Measured (Both Paths)

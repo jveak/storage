@@ -1,21 +1,24 @@
 """
 VectorDB benchmark CLI argument builder.
-
+ 
 This module defines the CLI arguments for the VectorDB benchmark,
-including datagen and run commands.
+including datasize, datagen, and run commands.
 """
-
-from mlpstorage_py.config import VECTOR_DTYPES, DISTRIBUTIONS, VECTORDB_DEFAULT_RUNTIME
+ 
+from mlpstorage_py.config import (
+    VECTOR_DTYPES, DISTRIBUTIONS, VECTORDB_DEFAULT_RUNTIME,
+    VDB_INDEX_TYPES, VDB_BENCHMARK_MODES,
+)
 from mlpstorage_py.cli.common_args import (
     HELP_MESSAGES,
     add_universal_arguments,
     add_timeseries_arguments,
 )
-
-
+ 
+ 
 def add_vectordb_arguments(parser):
     """Add VectorDB benchmark arguments to the parser.
-
+ 
     Args:
         parser: Argparse subparser for the VectorDB benchmark.
     """
@@ -25,8 +28,12 @@ def add_vectordb_arguments(parser):
         help="sub_commands"
     )
     parser.required = True
-
-    # Create subcommand parsers
+ 
+    # ---- Subcommand parsers ----
+    datasize = vectordb_subparsers.add_parser(
+        'datasize',
+        help="Calculate storage requirements for a VDB dataset"
+    )
     datagen = vectordb_subparsers.add_parser(
         'datagen',
         help=HELP_MESSAGES['vdb_datagen']
@@ -35,8 +42,8 @@ def add_vectordb_arguments(parser):
         'run',
         help=HELP_MESSAGES['vdb_run']
     )
-
-    # Common arguments for both datagen and run
+ 
+    # ---- Common arguments for datagen and run ----
     for _parser in [datagen, run_benchmark]:
         _parser.add_argument(
             '--host', '-s',
@@ -58,8 +65,40 @@ def add_vectordb_arguments(parser):
             type=str,
             help=HELP_MESSAGES['db_collection']
         )
-
-    # Datagen specific arguments
+ 
+    # ---- Datasize arguments ----
+    datasize.add_argument(
+        '--dimension',
+        type=int,
+        default=1536,
+        help=HELP_MESSAGES['dimension']
+    )
+    datasize.add_argument(
+        '--num-vectors',
+        type=int,
+        default=1_000_000,
+        help=HELP_MESSAGES['num_vectors']
+    )
+    datasize.add_argument(
+        '--index-type',
+        choices=VDB_INDEX_TYPES,
+        default="DISKANN",
+        help="Index type for storage estimation"
+    )
+    datasize.add_argument(
+        '--num-shards',
+        type=int,
+        default=1,
+        help=HELP_MESSAGES['num_shards']
+    )
+    datasize.add_argument(
+        '--vector-dtype',
+        choices=VECTOR_DTYPES,
+        default="FLOAT_VECTOR",
+        help=HELP_MESSAGES['vector_dtype']
+    )
+ 
+    # ---- Datagen specific arguments ----
     datagen.add_argument(
         '--dimension',
         type=int,
@@ -107,8 +146,8 @@ def add_vectordb_arguments(parser):
         action="store_true",
         help="Force recreate collection if it exists"
     )
-
-    # Run specific arguments
+ 
+    # ---- Run specific arguments ----
     run_benchmark.add_argument(
         '--num-query-processes',
         type=int,
@@ -127,7 +166,13 @@ def add_vectordb_arguments(parser):
         default=100,
         help=HELP_MESSAGES['vdb_report_count']
     )
-
+    run_benchmark.add_argument(
+        '--mode',
+        choices=VDB_BENCHMARK_MODES,
+        default='timed',
+        help="Benchmark mode: timed (simple_bench), query_count, or sweep (enhanced_bench)"
+    )
+ 
     # End condition group for run
     end_group = run_benchmark.add_argument_group(
         "Provide an end condition of runtime (in seconds) or total number of "
@@ -144,10 +189,10 @@ def add_vectordb_arguments(parser):
         type=int,
         help="Run for a specific number of queries"
     )
-
+ 
     # Add universal arguments to all subcommands
-    for _parser in [datagen, run_benchmark]:
+    for _parser in [datasize, datagen, run_benchmark]:
         add_universal_arguments(_parser)
-
+ 
     # Add time-series arguments to run command only
     add_timeseries_arguments(run_benchmark)

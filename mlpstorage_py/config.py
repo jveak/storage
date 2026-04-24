@@ -110,6 +110,11 @@ KVCACHE_GENERATION_MODES = ['none', 'fast', 'realistic']
 # Default runtime for KV Cache benchmark (seconds)
 KVCACHE_DEFAULT_DURATION = 60
 
+# VDB Benchmark Configuration
+VDB_INDEX_TYPES = ["DISKANN", "HNSW", "AISAQ", "IVF_FLAT", "IVF_SQ8", "FLAT"]
+VDB_ORCHESTRATION_MODES = ["ssh", "mpi"]
+VDB_BENCHMARK_MODES = ["timed", "query_count", "sweep"]
+
 MPIRUN = "mpirun"
 MPIEXEC = "mpiexec"
 MPI_CMDS = [MPIRUN, MPIEXEC]
