@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlpstorage"
-version = "3.0.0"
+version = "2.0.0b1"
 description = "MLPerf Storage Benchmark Suite"
 readme = "README.md"
+license = {text = "Apache-2.0"}
 authors = [
     {name = "MLCommons Storage Working Group"}
 ]
@@ -15,10 +16,13 @@ dependencies = [
     "psutil>=5.9",
     "pyarrow",
     "pyyaml>=6.0",
-    "packaging>=21.0", 
+    "packaging>=21.0",
     "rich>=13.0",
-    "s3dlio>=0.9.86",
     "dlio-benchmark", # Required dependency
+    "minio>=7.2.20",
+    "s3torchconnector>=1.5.0",
+    "s3dlio>=0.9.95",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -30,19 +34,25 @@ test = [
 full = [
     "dlio-benchmark",
 ]
+vectordb = [
+    "pymilvus>=2.4.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "tabulate>=0.9",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/mlcommons/storage"
 "Bug Tracker" = "https://github.com/mlcommons/storage/issues"
 
 [tool.setuptools]
-packages = {find = {}}
+packages = {find = {include = ["mlpstorage_py*", "vdbbench*"]}}
 
 [tool.setuptools.package-data]
-"mlpstorage" = ["../configs/dlio/workload/*.yaml"]
+"mlpstorage_py" = ["../configs/dlio/workload/*.yaml"]
 
 [project.scripts]
-mlpstorage = 'mlpstorage.main:main'
+mlpstorage = 'mlpstorage_py.main:main'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -54,7 +64,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["mlpstorage"]
+source = ["mlpstorage_py"]
 omit = ["*/tests/*", "*/__pycache__/*"]
 
 [tool.coverage.report]
@@ -75,7 +85,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-dlio-benchmark = { git = "https://github.com/mlcommons/DLIO_local_changes.git" }
+dlio-benchmark = { git = "https://github.com/russfellows/dlio_benchmark.git", branch = "feat/parquet-dgen-streaming" }
 torch = [{ index = "pytorch-cpu" }]
 torchvision = [{ index = "pytorch-cpu" }]
 torchaudio = [{ index = "pytorch-cpu" }]
