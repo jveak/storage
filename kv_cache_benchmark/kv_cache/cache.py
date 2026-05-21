@@ -16,7 +16,7 @@ import numpy as np
 
 from kv_cache._compat import TORCH_AVAILABLE, CUPY_AVAILABLE
 from kv_cache.config import cfg
-from kv_cache.models import ModelConfig, InferencePhase
+from kv_cache.models import ModelConfig, InferencePhase, QoSLevel
 from kv_cache.backends import (
     StorageBackend, GPUMemoryBackend, CPUMemoryBackend, NVMeBackend,
 )
@@ -104,7 +104,8 @@ class MultiTierCache:
                  performance_profile: str = 'latency',
                  seed: Optional[int] = None,
                  max_concurrent_allocs: int = 0,
-                 storage_capacity_gb: float = 0):
+                 storage_capacity_gb: float = 0,
+                 storage_cache_dir: str = None):
 
         self.model_config = model_config
         self.gpu_memory_limit = gpu_memory_gb * 1024**3
@@ -113,6 +114,7 @@ class MultiTierCache:
         self.performance_profile = performance_profile
         self.seed = seed
         self.max_concurrent_allocs = max_concurrent_allocs
+        self.storage_cache_enabled = storage_cache_dir is not None
 
         # Initialize storage backends for each tier.
         self.backends = {}
@@ -127,24 +129,20 @@ class MultiTierCache:
 
         self.backends['cpu'] = CPUMemoryBackend()
         self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
+        if self.storage_cache_enabled:
+            self.backends['storage_cache'] = NVMeBackend(base_path=storage_cache_dir)
 
         self.generator = KVCacheGenerator(model_config, global_seed=self.seed)
 
         self.cache_entries = {}
         self.entry_locks: Dict[str, threading.Lock] = {}
-        if storage_capacity_gb > 0:
-            self.nvme_memory_limit = storage_capacity_gb * 1024**3
-        else:
-            try:
-                nvme_base = self.backends['nvme'].base_path
-                st = os.statvfs(str(nvme_base))
-                self.nvme_memory_limit = float(st.f_bavail * st.f_frsize) * 0.95
-            except Exception:
-                self.nvme_memory_limit = float('inf')
+        self.nvme_memory_limit = self._resolve_storage_limit('nvme', storage_capacity_gb)
+        self.storage_cache_memory_limit = self._resolve_storage_limit('storage_cache', storage_capacity_gb)
 
         self.gpu_memory_used = 0
         self.cpu_memory_used = 0
         self.nvme_memory_used = 0
+        self.storage_cache_memory_used = 0
 
         self.metadata_lock = threading.Lock()
         self.memory_lock = threading.Lock()
@@ -161,6 +159,8 @@ class MultiTierCache:
             'evictions': 0,
             'offloads_cpu': 0,
             'offloads_storage': 0,
+            'offloads_storage_cache': 0,
+            'offloads_disk': 0,
 
             'gpu_read_latencies': [], 'cpu_read_latencies': [], 'storage_read_latencies': [],
             'gpu_write_latencies': [], 'cpu_write_latencies': [], 'storage_write_latencies': [],
@@ -180,6 +180,50 @@ class MultiTierCache:
 
             'storage_tokens_processed': 0,
         }
+
+    def _resolve_storage_limit(self, tier: str, storage_capacity_gb: float) -> float:
+        """Resolve capacity for a file-backed storage tier."""
+        if tier not in self.backends:
+            return 0
+        if storage_capacity_gb > 0:
+            return storage_capacity_gb * 1024**3
+        try:
+            base_path = self.backends[tier].base_path
+            st = os.statvfs(str(base_path))
+            return float(st.f_bavail * st.f_frsize) * 0.95
+        except Exception:
+            return float('inf')
+
+    def _is_storage_tier(self, tier: str) -> bool:
+        """Return True for file-backed storage tiers."""
+        return tier in ('nvme', 'storage_cache')
+
+    def _storage_stats_name(self, tier: str) -> str:
+        """Map internal storage locations to the public aggregate stats name."""
+        return 'storage' if self._is_storage_tier(tier) else tier
+
+    def _normalize_job_type(self, job_type) -> Optional[QoSLevel]:
+        """Normalize a caller-provided job type into a QoSLevel."""
+        if isinstance(job_type, QoSLevel):
+            return job_type
+        if isinstance(job_type, str):
+            try:
+                return QoSLevel(job_type.lower())
+            except ValueError:
+                return None
+        return None
+
+    def _select_storage_tier(self, job_type=None) -> str:
+        """Choose the file-backed offload target for the given JOB/QoS type."""
+        normalized = self._normalize_job_type(job_type)
+        if self.storage_cache_enabled and normalized in (QoSLevel.INTERACTIVE, QoSLevel.RESPONSIVE):
+            return 'storage_cache'
+        return 'nvme'
+
+    def _job_type_value(self, job_type=None) -> Optional[str]:
+        """Return the stable string value stored in cache entry metadata."""
+        normalized = self._normalize_job_type(job_type)
+        return normalized.value if normalized else None
 
     def _get_entry_lock(self, key: str) -> threading.Lock:
         """Get or create a lock for a specific cache entry."""
@@ -208,12 +252,12 @@ class MultiTierCache:
     # WATERFALL LRU EVICTION METHODS
     # ========================================================================
 
-    def _get_tier_order(self) -> List[str]:
+    def _get_tier_order(self, job_type=None) -> List[str]:
         """Returns the tier hierarchy from fastest to slowest."""
         tiers = []
         if 'gpu' in self.backends:
             tiers.append('gpu')
-        tiers.extend(['cpu', 'nvme'])
+        tiers.extend(['cpu', self._select_storage_tier(job_type)])
         return tiers
 
     def _get_tier_limit(self, tier: str) -> float:
@@ -222,8 +266,11 @@ class MultiTierCache:
             return self.gpu_memory_limit
         elif tier == 'cpu':
             return self.cpu_memory_limit
-        else:
+        elif tier == 'storage_cache':
+            return self.storage_cache_memory_limit
+        elif tier == 'nvme':
             return self.nvme_memory_limit
+        return 0
 
     def _get_tier_usage(self, tier: str) -> float:
         """Get the current memory usage for a tier in bytes."""
@@ -231,8 +278,11 @@ class MultiTierCache:
             return self.gpu_memory_used
         elif tier == 'cpu':
             return self.cpu_memory_used
-        else:
+        elif tier == 'storage_cache':
+            return self.storage_cache_memory_used
+        elif tier == 'nvme':
             return self.nvme_memory_used
+        return 0
 
     def _update_tier_usage(self, tier: str, delta: int):
         """Update the memory usage tracking for a tier."""
@@ -240,6 +290,8 @@ class MultiTierCache:
             self.gpu_memory_used = max(0, self.gpu_memory_used + delta)
         elif tier == 'cpu':
             self.cpu_memory_used = max(0, self.cpu_memory_used + delta)
+        elif tier == 'storage_cache':
+            self.storage_cache_memory_used = max(0, self.storage_cache_memory_used + delta)
         elif tier == 'nvme':
             self.nvme_memory_used = max(0, self.nvme_memory_used + delta)
 
@@ -284,8 +336,12 @@ class MultiTierCache:
                     self.stats['evictions'] += 1
                     if to_tier == 'cpu':
                         self.stats['offloads_cpu'] += 1
-                    elif to_tier == 'nvme':
+                    elif self._is_storage_tier(to_tier):
                         self.stats['offloads_storage'] += 1
+                        if to_tier == 'storage_cache':
+                            self.stats['offloads_storage_cache'] += 1
+                        else:
+                            self.stats['offloads_disk'] += 1
                         bytes_per_token = self.model_config.kv_cache_size_per_token
                         if bytes_per_token > 0:
                             tokens = size // bytes_per_token
@@ -300,12 +356,12 @@ class MultiTierCache:
                 logger.error(f"Failed to demote {key} from {from_tier} to {to_tier}: {e}")
                 return False, 0.0
 
-    def _ensure_space_in_tier(self, tier: str, required_bytes: int, recursion_depth: int = 0) -> bool:
+    def _ensure_space_in_tier(self, tier: str, required_bytes: int, recursion_depth: int = 0, job_type=None) -> bool:
         """Ensure there's enough space in a tier by evicting LRU entries."""
-        if tier == 'nvme' and self.nvme_memory_limit == float('inf'):
+        if self._is_storage_tier(tier) and self._get_tier_limit(tier) == float('inf'):
             # Still track usage even when unlimited, for accurate metrics
             with self.memory_lock:
-                self._update_tier_usage('nvme', required_bytes)
+                self._update_tier_usage(tier, required_bytes)
             return True
 
         max_recursion = cfg('eviction', 'max_recursion_depth', default=10)
@@ -313,14 +369,14 @@ class MultiTierCache:
             logger.warning("Hit recursion limit in _ensure_space_in_tier")
             return False
 
-        tier_order = self._get_tier_order()
+        tier_order = self._get_tier_order(job_type)
         try:
             tier_idx = tier_order.index(tier)
         except ValueError:
             return False
 
         next_tier = tier_order[tier_idx + 1] if tier_idx + 1 < len(tier_order) else None
-        if next_tier is None and tier != 'nvme':
+        if next_tier is None and not self._is_storage_tier(tier):
             return False
 
         # When NVMe is the terminal tier (no tier after it), the entry MUST
@@ -426,6 +482,8 @@ class MultiTierCache:
                             self.gpu_memory_used = actual_usage
                         elif tier == 'cpu':
                             self.cpu_memory_used = actual_usage
+                        elif tier == 'storage_cache':
+                            self.storage_cache_memory_used = actual_usage
                         elif tier == 'nvme':
                             self.nvme_memory_used = actual_usage
 
@@ -460,7 +518,7 @@ class MultiTierCache:
             lru_idx += 1
 
             # ── Evict: DELETE (terminal tier) or DEMOTE (non-terminal) ──
-            if next_tier is None and tier == 'nvme':
+            if next_tier is None and self._is_storage_tier(tier):
                 # Terminal tier: delete the .npy file from disk.
                 # The existence check prevents double-decrementing when
                 # multiple threads race on the same stale snapshot entry.
@@ -468,7 +526,7 @@ class MultiTierCache:
                 with entry_lock:
                     with self.metadata_lock:
                         existing = self.cache_entries.get(lru_key)
-                        if existing is None or existing['location'] != 'nvme':
+                        if existing is None or existing['location'] != tier:
                             # Another thread already evicted this entry.
                             # Safe to skip — just advance to the next one.
                             eviction_count += 1
@@ -477,21 +535,29 @@ class MultiTierCache:
                         del self.cache_entries[lru_key]
                         self.entry_locks.pop(lru_key, None)
                     try:
-                        self.backends['nvme'].delete(lru_key)
+                        self.backends[tier].delete(lru_key)
                     except Exception as e:
-                        logger.warning(f"Failed to delete NVMe entry {lru_key}: {e}")
+                        logger.warning(f"Failed to delete {tier} entry {lru_key}: {e}")
                     with self.memory_lock:
-                        self.nvme_memory_used = max(0, self.nvme_memory_used - actual_size)
+                        self._update_tier_usage(tier, -actual_size)
                 with self.stats_lock:
                     self.stats['evictions'] += 1
             else:
                 # Non-terminal tier: demote entry to the next tier down.
                 # Recursively ensure space in next_tier first.
-                if not self._ensure_space_in_tier(next_tier, lru_size, recursion_depth + 1):
-                    logger.warning(f"Could not make space in {next_tier} for demotion")
+                entry_job_type = lru_entry.get('job_type', job_type)
+                entry_tier_order = self._get_tier_order(entry_job_type)
+                try:
+                    target_tier = entry_tier_order[entry_tier_order.index(tier) + 1]
+                except (ValueError, IndexError):
+                    logger.warning(f"Could not find demotion target for {tier}")
                     return False
 
-                success, _ = self._demote_entry(lru_key, tier, next_tier)
+                if not self._ensure_space_in_tier(target_tier, lru_size, recursion_depth + 1, entry_job_type):
+                    logger.warning(f"Could not make space in {target_tier} for demotion")
+                    return False
+
+                success, _ = self._demote_entry(lru_key, tier, target_tier)
                 if not success:
                     # Entry was deleted/moved by another thread between
                     # the snapshot and now.  Skip to the next one.
@@ -509,7 +575,8 @@ class MultiTierCache:
 
         return False
 
-    def allocate_cache(self, key: str, num_tokens: int, phase: InferencePhase = InferencePhase.PREFILL) -> Tuple[bool, str, float]:
+    def allocate_cache(self, key: str, num_tokens: int, phase: InferencePhase = InferencePhase.PREFILL,
+                       job_type=None) -> Tuple[bool, str, float]:
         """Allocates and writes a new KV cache entry to the most appropriate tier."""
         with self.metadata_lock:
             if key in self.cache_entries:
@@ -519,12 +586,12 @@ class MultiTierCache:
             self.allocation_semaphore.acquire()
 
         try:
-            return self._allocate_cache_inner(key, num_tokens, phase)
+            return self._allocate_cache_inner(key, num_tokens, phase, job_type)
         finally:
             if self.allocation_semaphore:
                 self.allocation_semaphore.release()
 
-    def _allocate_cache_inner(self, key: str, num_tokens: int, phase: InferencePhase) -> Tuple[bool, str, float]:
+    def _allocate_cache_inner(self, key: str, num_tokens: int, phase: InferencePhase, job_type=None) -> Tuple[bool, str, float]:
         """Inner implementation of allocate_cache, called within semaphore."""
         try:
             data = self.generator.generate(sequence_length=num_tokens, key=key)
@@ -543,19 +610,19 @@ class MultiTierCache:
             self.stats['write_operations'] += 1
             self.stats['total_write_bytes'] += size_bytes
 
-        tier_order = self._get_tier_order()
+        tier_order = self._get_tier_order(job_type)
         allocated_tier = None
 
         for tier in tier_order:
-            if self._ensure_space_in_tier(tier, size_bytes):
+            if self._ensure_space_in_tier(tier, size_bytes, job_type=job_type):
                 allocated_tier = tier
                 break
 
         if allocated_tier is None:
-            logger.warning("All tiers full — eviction could not free space, forcing write to NVMe")
-            allocated_tier = 'nvme'
+            allocated_tier = self._select_storage_tier(job_type)
+            logger.warning(f"All tiers full, eviction could not free space, forcing write to {allocated_tier}")
             with self.memory_lock:
-                self._update_tier_usage('nvme', size_bytes)
+                self._update_tier_usage(allocated_tier, size_bytes)
 
         try:
             if allocated_tier == 'gpu':
@@ -563,26 +630,31 @@ class MultiTierCache:
             elif allocated_tier == 'cpu':
                 timing = self.backends['cpu'].write(key, data)
             else:
-                timing = self.backends['nvme'].write(key, data)
+                timing = self.backends[allocated_tier].write(key, data)
 
             with self.metadata_lock:
                 self.cache_entries[key] = {
                     'location': allocated_tier,
                     'size': size_bytes,
                     'last_access': time.time(),
-                    'access_count': 1
+                    'access_count': 1,
+                    'job_type': self._job_type_value(job_type)
                 }
 
             with self.stats_lock:
-                tier_stats_name = 'storage' if allocated_tier == 'nvme' else allocated_tier
+                tier_stats_name = self._storage_stats_name(allocated_tier)
 
                 self.stats[f'tier_{tier_stats_name}_kv_bytes_written'] += size_bytes
 
                 if allocated_tier == 'cpu':
                     self.stats['offloads_cpu'] += 1
                     self.stats['cpu_write_latencies'].append(timing.total)
-                elif allocated_tier == 'nvme':
+                elif self._is_storage_tier(allocated_tier):
                     self.stats['offloads_storage'] += 1
+                    if allocated_tier == 'storage_cache':
+                        self.stats['offloads_storage_cache'] += 1
+                    else:
+                        self.stats['offloads_disk'] += 1
                     self.stats['storage_write_latencies'].append(timing.total)
                     self.stats['storage_write_device_latencies'].append(timing.device)
                     self.stats['storage_write_host_latencies'].append(timing.host)
@@ -638,7 +710,7 @@ class MultiTierCache:
                 elif cache_type == 'multi_turn': self.stats['multi_turn_hits'] += 1
                 else: self.stats['user_cache_hits'] += 1
 
-                tier_stats_name = 'storage' if location == 'nvme' else location
+                tier_stats_name = self._storage_stats_name(location)
 
                 self.stats[f'tier_{tier_stats_name}_kv_bytes_read'] += entry_size
 
@@ -656,7 +728,7 @@ class MultiTierCache:
                         self.stats['gpu_read_latencies'].append(timing.total)
                     elif location == 'cpu':
                         self.stats['cpu_read_latencies'].append(timing.total)
-                    else:
+                    elif self._is_storage_tier(location):
                         self.stats['storage_read_latencies'].append(timing.total)
                         self.stats['storage_read_device_latencies'].append(timing.device)
                         self.stats['storage_read_host_latencies'].append(timing.host)
@@ -772,10 +844,13 @@ class MultiTierCache:
             gpu_entries = sum(1 for e in self.cache_entries.values() if e['location'] == 'gpu')
             cpu_entries = sum(1 for e in self.cache_entries.values() if e['location'] == 'cpu')
             nvme_entries = sum(1 for e in self.cache_entries.values() if e['location'] == 'nvme')
+            storage_cache_entries = sum(1 for e in self.cache_entries.values() if e['location'] == 'storage_cache')
 
         with self.memory_lock:
             gpu_mem_used = self.gpu_memory_used
             cpu_mem_used = self.cpu_memory_used
+            nvme_mem_used = self.nvme_memory_used
+            storage_cache_mem_used = self.storage_cache_memory_used
 
         storage_health = self._evaluate_storage_performance(duration)
 
@@ -792,11 +867,19 @@ class MultiTierCache:
             'cache_misses': stats_snapshot['cache_misses'],
             'gpu_entries': gpu_entries,
             'cpu_entries': cpu_entries,
-            'storage_entries': nvme_entries,
+            'storage_entries': nvme_entries + storage_cache_entries,
+            'storage_cache_entries': storage_cache_entries,
+            'disk_entries': nvme_entries,
             'gpu_memory_used_gb': gpu_mem_used / 1024**3,
             'cpu_memory_used_gb': cpu_mem_used / 1024**3,
+            'storage_cache_memory_used_gb': storage_cache_mem_used / 1024**3,
+            'disk_memory_used_gb': nvme_mem_used / 1024**3,
             'offloads_cpu': stats_snapshot['offloads_cpu'],
             'offloads_storage': stats_snapshot['offloads_storage'],
+            'offloads_storage_cache': stats_snapshot['offloads_storage_cache'],
+            'offloads_disk': stats_snapshot['offloads_disk'],
+            'storage_cache_path': str(self.backends['storage_cache'].base_path) if self.storage_cache_enabled else None,
+            'disk_path': str(self.backends['nvme'].base_path),
             'storage_health': storage_health,
             'prefill_writes': self.stats['prefill_writes'],
             'decode_reads': self.stats['decode_reads'],

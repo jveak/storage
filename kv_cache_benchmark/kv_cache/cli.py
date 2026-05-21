@@ -78,6 +78,7 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Max Requests': args.max_requests,
         'Dataset Path': args.dataset_path or 'N/A',
         'Cache Dir': args.cache_dir or 'temp',
+        'Storage Cache Dir': getattr(args, 'storage_cache_dir', None) or 'disabled',
         'Storage Capacity (GB)': args.storage_capacity_gb,
         'Precondition': args.precondition,
         'Precondition Size (GB)': args.precondition_size_gb,
@@ -243,7 +244,9 @@ def main():
     parser.add_argument('--cpu-mem-gb', type=float, default=32,
                         help='The amount of CPU memory (RAM) to allocate for the cache in GB.')
     parser.add_argument('--cache-dir', type=str, default=None,
-                        help='The directory to use for the NVMe cache tier.')
+                        help='The directory to use for the disk/storage tier.')
+    parser.add_argument('--storage-cache-dir', type=str, default=None,
+                        help='Optional directory for the storage-cache tier. Interactive/responsive jobs offload here; batch jobs use --cache-dir.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
                         help='The token generation speed simulation mode.')
     parser.add_argument('--performance-profile', type=str, default='latency', choices=['latency', 'throughput'],
@@ -371,6 +374,7 @@ def main():
         request_rate=args.request_rate,
         max_requests=args.max_requests,
         storage_capacity_gb=args.storage_capacity_gb,
+        storage_cache_dir=args.storage_cache_dir,
         precondition=args.precondition,
         precondition_size_gb=args.precondition_size_gb,
         precondition_threads=args.precondition_threads,

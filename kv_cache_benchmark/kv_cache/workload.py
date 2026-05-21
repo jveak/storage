@@ -193,18 +193,22 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     if not (0.0 <= args.target_saturation <= 1.0):
         errors.append(f"--target-saturation must be between 0.0 and 1.0, got {args.target_saturation}")
 
-    if args.cache_dir:
-        cache_path = Path(args.cache_dir).resolve()
-        cache_path_str = str(cache_path)
+    for dir_arg, label in (
+        (getattr(args, 'cache_dir', None), '--cache-dir'),
+        (getattr(args, 'storage_cache_dir', None), '--storage-cache-dir'),
+    ):
+        if dir_arg:
+            cache_path = Path(dir_arg).resolve()
+            cache_path_str = str(cache_path)
 
-        for prefix in FORBIDDEN_CACHE_PREFIXES:
-            if cache_path_str.startswith(prefix):
-                errors.append(f"--cache-dir cannot be a system directory: {cache_path}")
-                break
+            for prefix in FORBIDDEN_CACHE_PREFIXES:
+                if cache_path_str.startswith(prefix):
+                    errors.append(f"{label} cannot be a system directory: {cache_path}")
+                    break
 
-        parent = cache_path.parent
-        if parent.exists() and not os.access(parent, os.W_OK):
-            errors.append(f"--cache-dir parent is not writable: {parent}")
+            parent = cache_path.parent
+            if parent.exists() and not os.access(parent, os.W_OK):
+                errors.append(f"{label} parent is not writable: {parent}")
 
     if errors:
         for error in errors:

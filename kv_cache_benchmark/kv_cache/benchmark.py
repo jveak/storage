@@ -67,6 +67,7 @@ class IntegratedBenchmark:
                  request_rate: float = 0,
                  max_requests: int = 0,
                  storage_capacity_gb: float = 0,
+                 storage_cache_dir: str = None,
                  precondition: bool = False,
                  precondition_size_gb: float = 0,
                  precondition_threads: int = 0,
@@ -96,6 +97,7 @@ class IntegratedBenchmark:
         self.request_rate = request_rate
         self.max_requests = max_requests
         self.storage_capacity_gb = storage_capacity_gb
+        self.storage_cache_dir = storage_cache_dir
         self.precondition = precondition
         self.precondition_size_gb = precondition_size_gb
         self.precondition_threads = precondition_threads if precondition_threads > 0 else (os.cpu_count() or 4)
@@ -128,7 +130,8 @@ class IntegratedBenchmark:
             performance_profile=performance_profile,
             seed=seed,
             max_concurrent_allocs=max_concurrent_allocs,
-            storage_capacity_gb=storage_capacity_gb
+            storage_capacity_gb=storage_capacity_gb,
+            storage_cache_dir=storage_cache_dir
         )
         self.conversation_manager = ConversationManager()
         self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None
@@ -529,7 +532,7 @@ class IntegratedBenchmark:
             if not self.decode_only:
                 if request.phase == InferencePhase.PREFILL or request.phase == InferencePhase.PREFILL_DECODE:
                     success, location, write_latency = self.cache.allocate_cache(
-                        request.cache_key, request.context_tokens, InferencePhase.PREFILL
+                        request.cache_key, request.context_tokens, InferencePhase.PREFILL, request.qos_level
                     )
                     storage_latency += write_latency
                     with self.results_lock: self.results['prefill_latencies'].append(write_latency)
@@ -563,7 +566,8 @@ class IntegratedBenchmark:
                             _, _, write_latency = self.cache.allocate_cache(
                                 request.cache_key,
                                 request.context_tokens,
-                                InferencePhase.PREFILL
+                                InferencePhase.PREFILL,
+                                request.qos_level
                             )
                             storage_latency += write_latency
                     else:
@@ -1046,6 +1050,14 @@ class IntegratedBenchmark:
         print(f"  GPU Entries: {cache_stats['gpu_entries']} ({cache_stats['gpu_memory_used_gb']:.2f} GB)")
         print(f"  CPU Entries: {cache_stats['cpu_entries']} ({cache_stats['cpu_memory_used_gb']:.2f} GB)")
         print(f"  Storage Entries: {cache_stats['storage_entries']}")
+        if cache_stats.get('storage_cache_path'):
+            print(f"  Storage Cache Entries: {cache_stats.get('storage_cache_entries', 0)} "
+                  f"({cache_stats.get('storage_cache_memory_used_gb', 0):.2f} GB)")
+            print(f"  Storage Cache Path: {cache_stats['storage_cache_path']}")
+        print(f"  Disk Entries: {cache_stats.get('disk_entries', 0)} "
+              f"({cache_stats.get('disk_memory_used_gb', 0):.2f} GB)")
+        if cache_stats.get('disk_path'):
+            print(f"  Disk Path: {cache_stats['disk_path']}")
 
         print(f"\n### TIER-SPECIFIC KV BYTES ###")
         if cache_stats.get('tier_gpu_kv_bytes_written_gb', 0) > 0:
