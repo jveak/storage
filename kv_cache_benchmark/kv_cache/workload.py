@@ -227,13 +227,13 @@ class UserSimulator:
 
     DEFAULT_USER_TEMPLATES = {
         'chatbot': {
-            'context_range': (512, 4096), 'generation_range': (50, 200), 'think_time_range': (0.1, 0.5),
+            'context_range': (4096, 8192), 'generation_range': (128, 256), 'think_time_range': (0.1, 0.5),
         },
         'coding': {
-            'context_range': (4096, 25000), 'generation_range': (100, 500), 'think_time_range': (0.2, 1.0),
+            'context_range': (4096, 8192), 'generation_range': (128, 256), 'think_time_range': (0.1, 0.5),
         },
         'document': {
-            'context_range': (4096, 16384), 'generation_range': (200, 800), 'think_time_range': (0.3, 1.5),
+            'context_range': (4096, 8192), 'generation_range': (128, 256), 'think_time_range': (0.1, 0.5),
         },
     }
 
@@ -268,8 +268,8 @@ class UserSimulator:
     @classmethod
     def generate_mixed_users(cls, num_users: int) -> List[UserProfile]:
         """Generates a list of users with a realistic distribution of types and QoS levels."""
-        interactive_prob = cfg('qos_distribution', 'interactive_probability', default=0.15)
-        responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=0.50)
+        interactive_prob = cfg('qos_distribution', 'interactive_probability', default=1.0)
+        responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=1.0)
 
         users = []
         for i in range(num_users):

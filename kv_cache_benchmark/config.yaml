@@ -29,29 +29,19 @@
 # =============================================================================
 user_templates:
   chatbot:
-    # General-purpose conversational use. Non-programming categories stay
-    # well below the platform average of ~6K input tokens [1]. Zipf-shaped
-    # request distribution means most chatbot prompts are short [2].
-    context_range: [512, 4096]
-    # Completions average ~400 tokens across all categories [1].
-    generation_range: [50, 200]
+    # Story 1 uses a single interactive request shape. Keep every template
+    # below the 10K-token PREFILL-only threshold so requests use prefill+decode.
+    context_range: [4096, 8192]
+    generation_range: [128, 256]
     think_time_range: [0.1, 0.5]
   coding:
-    # Programming is the dominant context-length driver, "routinely exceeding
-    # 20K input tokens" and averaging 3-4x general-purpose prompts [1].
-    # Claude handles ~60% of coding workloads at >20K avg prompt tokens [1].
-    context_range: [4096, 25000]
-    # Output stays modest relative to input (~15:1 input:output ratio) [1].
-    generation_range: [100, 500]
-    think_time_range: [0.2, 1.0]
+    context_range: [4096, 8192]
+    generation_range: [128, 256]
+    think_time_range: [0.1, 0.5]
   document:
-    # Long-context document analysis (summarization, Q&A over files).
-    # Sits between chatbot and coding; context-heavy but below coding peaks.
-    # Overall avg sequence length >5,400 tokens by late 2025 [1].
-    context_range: [4096, 16384]
-    # Longer outputs for summaries/analysis; still within ~400 avg [1].
-    generation_range: [200, 800]
-    think_time_range: [0.3, 1.5]
+    context_range: [4096, 8192]
+    generation_range: [128, 256]
+    think_time_range: [0.1, 0.5]
 
 # =============================================================================
 # TOKEN GENERATION TIMING
@@ -103,8 +93,8 @@ qos_profiles:
 # Example: 0.15 interactive, 0.50 threshold → 15% INTERACTIVE, 35% RESPONSIVE, 50% BATCH
 # =============================================================================
 qos_distribution:
-  interactive_probability: 0.15
-  responsive_threshold: 0.50
+  interactive_probability: 1.0
+  responsive_threshold: 1.0
 
 # =============================================================================
 # EVICTION SETTINGS

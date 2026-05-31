@@ -214,11 +214,8 @@ class MultiTierCache:
         return None
 
     def _select_storage_tier(self, job_type=None) -> str:
-        """Choose the file-backed offload target for the given JOB/QoS type."""
-        normalized = self._normalize_job_type(job_type)
-        if self.storage_cache_enabled and normalized in (QoSLevel.INTERACTIVE, QoSLevel.RESPONSIVE):
-            return 'storage_cache'
-        return 'nvme'
+        """Choose the first file-backed tier for new storage allocations."""
+        return 'storage_cache' if self.storage_cache_enabled else 'nvme'
 
     def _job_type_value(self, job_type=None) -> Optional[str]:
         """Return the stable string value stored in cache entry metadata."""
@@ -257,7 +254,10 @@ class MultiTierCache:
         tiers = []
         if 'gpu' in self.backends:
             tiers.append('gpu')
-        tiers.extend(['cpu', self._select_storage_tier(job_type)])
+        tiers.append('cpu')
+        if self.storage_cache_enabled:
+            tiers.append('storage_cache')
+        tiers.append('nvme')
         return tiers
 
     def _get_tier_limit(self, tier: str) -> float:
@@ -619,7 +619,7 @@ class MultiTierCache:
                 break
 
         if allocated_tier is None:
-            allocated_tier = self._select_storage_tier(job_type)
+            allocated_tier = tier_order[-1]
             logger.warning(f"All tiers full, eviction could not free space, forcing write to {allocated_tier}")
             with self.memory_lock:
                 self._update_tier_usage(allocated_tier, size_bytes)

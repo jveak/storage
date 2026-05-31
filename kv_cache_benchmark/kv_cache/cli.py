@@ -92,6 +92,9 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Total Tokens': summary.get('total_tokens'),
         'Elapsed Time (s)': summary.get('elapsed_time'),
         'Avg Throughput (tok/s)': summary.get('avg_throughput_tokens_per_sec'),
+        'Cache Miss Adjusted Throughput (tok/s)': summary.get('cache_miss_adjusted_throughput_tokens_per_sec'),
+        'Cache Miss Penalty (s)': get_nested(summary, ['cache_miss_penalty', 'penalty_seconds']),
+        'Cache Miss Penalty Per Miss (s)': get_nested(summary, ['cache_miss_penalty', 'penalty_seconds_per_miss']),
         'Storage Throughput (tok/s)': summary.get('storage_throughput_tokens_per_sec'),
         'Requests/sec': summary.get('requests_per_second'),
 
@@ -244,9 +247,9 @@ def main():
     parser.add_argument('--cpu-mem-gb', type=float, default=32,
                         help='The amount of CPU memory (RAM) to allocate for the cache in GB.')
     parser.add_argument('--cache-dir', type=str, default=None,
-                        help='The directory to use for the disk/storage tier.')
+                        help='The directory to use for the disk/storage tier (TLC in dual-tier runs).')
     parser.add_argument('--storage-cache-dir', type=str, default=None,
-                        help='Optional directory for the storage-cache tier. Interactive/responsive jobs offload here; batch jobs use --cache-dir.')
+                        help='Optional first storage tier (SLC). New storage writes try this tier before falling through to --cache-dir.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
                         help='The token generation speed simulation mode.')
     parser.add_argument('--performance-profile', type=str, default='latency', choices=['latency', 'throughput'],

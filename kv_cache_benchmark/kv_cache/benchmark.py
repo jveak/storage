@@ -154,9 +154,11 @@ class IntegratedBenchmark:
         self.user_generators = {}
         self.user_conversations: Dict[str, str] = {}
         self.user_conversations_lock = threading.Lock()
+        self.conversation_turn_condition = threading.Condition()
+        self.conversation_completed_turns: Dict[str, int] = {}
 
         self.results = {
-            'requests_completed': 0, 'total_tokens_generated': 0,
+            'requests_completed': 0, 'total_tokens_generated': 0, 'total_context_tokens': 0,
             'total_storage_io_latency': 0.0, 'total_generation_latency': 0.0,
             'end_to_end_latencies': [], 'storage_latencies': [], 'generation_latencies': [],
             'throughput_timeline': [], 'prefill_latencies': [], 'decode_latencies': [],
@@ -247,8 +249,8 @@ class IntegratedBenchmark:
         prev_timestamp = None
         trace_total_tokens_sum = 0
 
-        interactive_prob = cfg('qos_distribution', 'interactive_probability', default=0.15)
-        responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=0.50)
+        interactive_prob = cfg('qos_distribution', 'interactive_probability', default=1.0)
+        responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=1.0)
 
         while not stop_event.is_set():
             rows_in_cycle = 0
@@ -355,8 +357,8 @@ class IntegratedBenchmark:
                 req_id = self.request_counter
                 self.request_counter += 1
 
-            interactive_prob = cfg('qos_distribution', 'interactive_probability', default=0.15)
-            responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=0.50)
+            interactive_prob = cfg('qos_distribution', 'interactive_probability', default=1.0)
+            responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=1.0)
 
             rand = random.random()
             if rand < interactive_prob:
@@ -492,6 +494,30 @@ class IntegratedBenchmark:
 
         stop_event.wait()
 
+    def _wait_for_prior_turn(self, request: InferenceRequest, stop_event: threading.Event) -> bool:
+        """Block a conversation turn until the previous turn has finished writing."""
+        if not self.enable_multi_turn or not request.conversation_id or request.turn_number <= 1:
+            return not stop_event.is_set()
+
+        with self.conversation_turn_condition:
+            while not stop_event.is_set():
+                completed_turn = self.conversation_completed_turns.get(request.conversation_id, 0)
+                if completed_turn >= request.turn_number - 1:
+                    return True
+                self.conversation_turn_condition.wait(timeout=0.1)
+        return False
+
+    def _mark_turn_complete(self, request: InferenceRequest):
+        """Publish completion for waiters on later turns in the same conversation."""
+        if not self.enable_multi_turn or not request.conversation_id or request.turn_number <= 0:
+            return
+
+        with self.conversation_turn_condition:
+            completed_turn = self.conversation_completed_turns.get(request.conversation_id, 0)
+            if request.turn_number > completed_turn:
+                self.conversation_completed_turns[request.conversation_id] = request.turn_number
+            self.conversation_turn_condition.notify_all()
+
     def process_requests(self, stop_event: threading.Event):
         """The main worker loop that processes requests from the queue."""
         while not stop_event.is_set():
@@ -503,6 +529,9 @@ class IntegratedBenchmark:
             # Check again after dequeue — don't start expensive I/O after stop
             if stop_event.is_set():
                 break
+
+            if not self._wait_for_prior_turn(request, stop_event):
+                continue
 
             request.start_time = time.perf_counter()
             storage_latency = 0.0
@@ -573,7 +602,8 @@ class IntegratedBenchmark:
                     else:
                         decode_batch_size = cfg('decode', 'batch_size', default=32)
                         num_batched_reads = max(1, (request.generate_tokens + decode_batch_size - 1) // decode_batch_size)
-                        for _ in range(num_batched_reads):
+                        storage_latency += read_latency
+                        for _ in range(num_batched_reads - 1):
                             _, batch_read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
                             storage_latency += batch_read_latency
 
@@ -589,6 +619,7 @@ class IntegratedBenchmark:
             with self.results_lock:
                 self.results['requests_completed'] += 1
                 self.results['total_tokens_generated'] += request.generate_tokens
+                self.results['total_context_tokens'] += request.context_tokens
                 self.results['total_storage_io_latency'] += storage_latency
                 self.results['total_generation_latency'] += generation_latency
                 self.results['end_to_end_latencies'].append(request.total_latency_ms / 1000)
@@ -600,6 +631,7 @@ class IntegratedBenchmark:
                         self.stop_event.set()
 
             self.qos_monitor.record_request(request)
+            self._mark_turn_complete(request)
 
     def monitor_stats(self, stop_event: threading.Event):
         """Periodically collects and logs stats, and triggers autoscaling."""
@@ -689,7 +721,7 @@ class IntegratedBenchmark:
         print(f"  - Autoscaling: {'Enabled' if self.enable_autoscaling else 'Disabled'}")
         if self.enable_autoscaling:
             print(f"    - Mode: {self.autoscaler.mode}")
-        print(f"  - QoS Support: Enabled (Interactive/Responsive/Batch)")
+        print(f"  - QoS Support: Enabled (Story 1 default: Interactive only)")
         print(f"  - Trace-Driven (BurstGPT): {'Enabled' if self.use_burst_trace else 'Disabled'}")
         if self.use_burst_trace:
             print(f"    Trace files: {len(self.burst_trace_files)}")
@@ -907,6 +939,28 @@ class IntegratedBenchmark:
         prefix_stats = self.prefix_cache_manager.stats if self.prefix_cache_manager else {}
         autoscaling_stats = self.autoscaler.scaling_history if self.autoscaler else []
 
+        cache_misses = cache_stats.get('cache_misses', 0)
+        avg_context_tokens = (
+            self.results['total_context_tokens'] / self.results['requests_completed']
+            if self.results['requests_completed'] > 0 else 0
+        )
+        prefill_compute_seconds_per_miss = avg_context_tokens * GENERATION_TIMING[self.generation_mode]
+        prefill_write_seconds_per_miss = (
+            float(np.mean(self.results['prefill_latencies']))
+            if self.results['prefill_latencies'] else 0.0
+        )
+        cache_miss_penalty_per_miss = prefill_compute_seconds_per_miss + prefill_write_seconds_per_miss
+        cache_miss_penalty_seconds = cache_misses * cache_miss_penalty_per_miss
+        adjusted_elapsed_time = duration + cache_miss_penalty_seconds
+        adjusted_throughput = (
+            self.results['total_tokens_generated'] / adjusted_elapsed_time
+            if adjusted_elapsed_time > 0 else 0
+        )
+        adjusted_seconds_per_token = (
+            adjusted_elapsed_time / self.results['total_tokens_generated']
+            if self.results['total_tokens_generated'] > 0 else 0
+        )
+
         autoscaling_summary = None
         if self.autoscaler:
             autoscaling_summary = {
@@ -923,8 +977,19 @@ class IntegratedBenchmark:
         summary = {
             'total_requests': self.results['requests_completed'],
             'total_tokens': self.results['total_tokens_generated'],
+            'total_context_tokens': self.results['total_context_tokens'],
             'elapsed_time': duration,
             'avg_throughput_tokens_per_sec': self.results['total_tokens_generated'] / duration,
+            'cache_miss_adjusted_elapsed_time': adjusted_elapsed_time,
+            'cache_miss_adjusted_throughput_tokens_per_sec': adjusted_throughput,
+            'cache_miss_adjusted_seconds_per_token': adjusted_seconds_per_token,
+            'cache_miss_penalty': {
+                'cache_misses': cache_misses,
+                'penalty_seconds': cache_miss_penalty_seconds,
+                'penalty_seconds_per_miss': cache_miss_penalty_per_miss,
+                'prefill_compute_seconds_per_miss': prefill_compute_seconds_per_miss,
+                'prefill_write_seconds_per_miss': prefill_write_seconds_per_miss,
+            },
             'total_storage_io_time': self.results['total_storage_io_latency'],
             'storage_throughput_tokens_per_sec': self.results['total_tokens_generated'] / self.results['total_storage_io_latency'] if self.results['total_storage_io_latency'] > 0 else 0,
             'requests_per_second': self.results['requests_completed'] / duration,
@@ -1010,6 +1075,7 @@ class IntegratedBenchmark:
         print(f"Requests Completed: {summary['total_requests']}")
         print(f"Total Tokens Generated: {summary['total_tokens']}")
         print(f"Throughput (wall-clock): {summary['avg_throughput_tokens_per_sec']:.2f} tokens/sec")
+        print(f"Throughput (cache-miss adjusted): {summary['cache_miss_adjusted_throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"Throughput (storage I/O): {summary['storage_throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"Requests/sec: {summary['requests_per_second']:.2f}")
 
