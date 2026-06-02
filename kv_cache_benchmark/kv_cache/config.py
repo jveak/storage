@@ -38,6 +38,11 @@ class ConfigLoader:
             'fast': (int, float),
             'realistic': (int, float),
         },
+        'prefill_timing': {
+            'none': (int, float),
+            'fast': (int, float),
+            'realistic': (int, float),
+        },
         'qos_profiles': {
             'interactive': {'target_latency_p95_ms': (int, float), 'target_latency_p99_ms': (int, float),
                            'target_latency_p999_ms': (int, float), 'target_latency_p9999_ms': (int, float), 'priority': int},

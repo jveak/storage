@@ -57,6 +57,16 @@ generation_timing:
   realistic: 0.030
 
 # =============================================================================
+# PREFILL RECOMPUTE TIMING
+# Simulates GPU prefill time when a decode cache miss forces KV recomputation.
+# Values in seconds per input token.
+# =============================================================================
+prefill_timing:
+  none: 0.0
+  fast: 0.0005
+  realistic: 0.002
+
+# =============================================================================
 # QOS PROFILES (Quality of Service)
 # Defines SLA targets for different priority levels.
 # All latency values in milliseconds.

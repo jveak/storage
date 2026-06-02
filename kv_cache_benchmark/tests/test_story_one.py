@@ -102,3 +102,32 @@ def test_multi_turn_processing_waits_for_previous_turn(tmp_path):
     benchmark._mark_turn_complete(turn_1)
     thread.join(timeout=2)
     assert released.is_set()
+
+
+def test_prefill_mode_records_cache_miss_recompute_latency(tmp_path):
+    benchmark = IntegratedBenchmark(
+        model_config=MODEL_CONFIGS["tiny-1b"],
+        num_users=1,
+        gpu_memory_gb=0,
+        cpu_memory_gb=0,
+        duration_seconds=1,
+        cache_dir=str(tmp_path / "tlc"),
+        generation_mode=GenerationMode.NONE,
+        prefill_mode=GenerationMode.FAST,
+    )
+    request = InferenceRequest(
+        user_id="user_1",
+        request_id="req_1",
+        timestamp=datetime.now(),
+        context_tokens=2,
+        generate_tokens=1,
+        priority=3,
+        phase=InferencePhase.DECODE,
+        qos_level=QoSLevel.INTERACTIVE,
+    )
+
+    latency = benchmark._simulate_cache_miss_prefill(request)
+
+    assert abs(latency - 0.001) < 1e-9
+    assert benchmark.results["cache_miss_prefill_compute_latencies"] == [latency]
+    assert benchmark.results["total_cache_miss_prefill_compute_latency"] == latency

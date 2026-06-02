@@ -67,6 +67,7 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'GPU Memory (GB)': args.gpu_mem_gb,
         'CPU Memory (GB)': args.cpu_mem_gb,
         'Generation Mode': args.generation_mode,
+        'Prefill Mode': getattr(args, 'prefill_mode', 'none'),
         'Performance Profile': args.performance_profile,
         'Multi-turn': not args.disable_multi_turn,
         'Prefix Caching': not args.disable_prefix_caching,
@@ -95,6 +96,9 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Cache Miss Adjusted Throughput (tok/s)': summary.get('cache_miss_adjusted_throughput_tokens_per_sec'),
         'Cache Miss Penalty (s)': get_nested(summary, ['cache_miss_penalty', 'penalty_seconds']),
         'Cache Miss Penalty Per Miss (s)': get_nested(summary, ['cache_miss_penalty', 'penalty_seconds_per_miss']),
+        'Cache Miss Recomputes': get_nested(summary, ['cache_miss_penalty', 'cache_miss_recomputes']),
+        'Cache Miss Runtime Prefill Compute (s)': get_nested(summary, ['cache_miss_penalty', 'runtime_prefill_compute_seconds']),
+        'Cache Miss Additional Write (s)': get_nested(summary, ['cache_miss_penalty', 'additional_write_seconds']),
         'Storage Throughput (tok/s)': summary.get('storage_throughput_tokens_per_sec'),
         'Requests/sec': summary.get('requests_per_second'),
 
@@ -252,6 +256,8 @@ def main():
                         help='Optional first storage tier (SLC). New storage writes try this tier before falling through to --cache-dir.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
                         help='The token generation speed simulation mode.')
+    parser.add_argument('--prefill-mode', type=str, default='none', choices=[g.value for g in GenerationMode],
+                        help='GPU prefill recomputation speed to simulate when decode cache misses occur.')
     parser.add_argument('--performance-profile', type=str, default='latency', choices=['latency', 'throughput'],
                         help='The performance profile to use for pass/fail criteria.')
     parser.add_argument('--disable-multi-turn', action='store_true',
@@ -350,6 +356,7 @@ def main():
 
     model_config = CURRENT_MODEL_CONFIGS[args.model]
     gen_mode = GenerationMode(args.generation_mode)
+    prefill_mode = GenerationMode(args.prefill_mode)
 
     benchmark = IntegratedBenchmark(
         model_config=model_config,
@@ -367,6 +374,7 @@ def main():
         rag_num_docs=args.rag_num_docs,
         validation_trace=args.validation_trace,
         generation_mode=gen_mode,
+        prefill_mode=prefill_mode,
         performance_profile=args.performance_profile,
         use_burst_trace=args.use_burst_trace,
         burst_trace_path=args.burst_trace_path,

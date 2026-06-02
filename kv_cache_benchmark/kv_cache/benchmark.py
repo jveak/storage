@@ -37,6 +37,12 @@ from kv_cache.workload import (
 
 logger = logging.getLogger(__name__)
 
+PREFILL_TIMING = {
+    GenerationMode.NONE: 0.0,
+    GenerationMode.FAST: 0.0005,
+    GenerationMode.REALISTIC: 0.002,
+}
+
 
 class IntegratedBenchmark:
     """The main orchestrator for the entire benchmark."""
@@ -57,6 +63,7 @@ class IntegratedBenchmark:
                  rag_num_docs: int = 10,
                  validation_trace: Optional[str] = None,
                  generation_mode: GenerationMode = GenerationMode.NONE,
+                 prefill_mode: GenerationMode = GenerationMode.NONE,
                  performance_profile: str = 'latency',
                  use_burst_trace: bool = False,
                  burst_trace_path: Optional[str] = None,
@@ -84,6 +91,13 @@ class IntegratedBenchmark:
         self.enable_multi_turn = enable_multi_turn
         self.generation_mode = generation_mode
         self.ms_per_token = GENERATION_TIMING[generation_mode] * 1000
+        self.prefill_mode = prefill_mode
+        self.prefill_seconds_per_token = cfg(
+            'prefill_timing',
+            prefill_mode.value,
+            default=PREFILL_TIMING[prefill_mode],
+        )
+        self.prefill_ms_per_token = self.prefill_seconds_per_token * 1000
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_rag = enable_rag
         self.rag_num_docs = rag_num_docs
@@ -160,8 +174,10 @@ class IntegratedBenchmark:
         self.results = {
             'requests_completed': 0, 'total_tokens_generated': 0, 'total_context_tokens': 0,
             'total_storage_io_latency': 0.0, 'total_generation_latency': 0.0,
+            'total_cache_miss_prefill_compute_latency': 0.0,
             'end_to_end_latencies': [], 'storage_latencies': [], 'generation_latencies': [],
             'throughput_timeline': [], 'prefill_latencies': [], 'decode_latencies': [],
+            'cache_miss_prefill_compute_latencies': [], 'cache_miss_write_latencies': [],
             'multi_turn_cache_hits': 0, 'multi_turn_cache_misses': 0,
             'seed': self.seed,
         }
@@ -518,6 +534,18 @@ class IntegratedBenchmark:
                 self.conversation_completed_turns[request.conversation_id] = request.turn_number
             self.conversation_turn_condition.notify_all()
 
+    def _simulate_cache_miss_prefill(self, request: InferenceRequest) -> float:
+        """Simulate prefill recomputation after a decode cache miss."""
+        prefill_compute_latency = request.context_tokens * self.prefill_seconds_per_token
+        if prefill_compute_latency > 0:
+            time.sleep(prefill_compute_latency)
+
+        with self.results_lock:
+            self.results['cache_miss_prefill_compute_latencies'].append(prefill_compute_latency)
+            self.results['total_cache_miss_prefill_compute_latency'] += prefill_compute_latency
+
+        return prefill_compute_latency
+
     def process_requests(self, stop_event: threading.Event):
         """The main worker loop that processes requests from the queue."""
         while not stop_event.is_set():
@@ -592,6 +620,7 @@ class IntegratedBenchmark:
                     if location is None:
                         # Cache miss during decode - need to allocate (unless decode_only)
                         if not self.decode_only:
+                            self._simulate_cache_miss_prefill(request)
                             _, _, write_latency = self.cache.allocate_cache(
                                 request.cache_key,
                                 request.context_tokens,
@@ -599,6 +628,8 @@ class IntegratedBenchmark:
                                 request.qos_level
                             )
                             storage_latency += write_latency
+                            with self.results_lock:
+                                self.results['cache_miss_write_latencies'].append(write_latency)
                     else:
                         decode_batch_size = cfg('decode', 'batch_size', default=32)
                         num_batched_reads = max(1, (request.generate_tokens + decode_batch_size - 1) // decode_batch_size)
@@ -713,6 +744,7 @@ class IntegratedBenchmark:
         if self.seed is not None:
             print(f"Seed: {self.seed}")
         print(f"Generation Mode: {self.generation_mode.value} ({self.ms_per_token:.1f}ms/token)")
+        print(f"Prefill Recompute Mode: {self.prefill_mode.value} ({self.prefill_ms_per_token:.1f}ms/input token)")
         print(f"Features:")
         print(f"  - Phase-Aware Processing: Enabled")
         print(f"  - Multi-turn Conversations: {'Enabled' if self.enable_multi_turn else 'Disabled'}")
@@ -940,18 +972,26 @@ class IntegratedBenchmark:
         autoscaling_stats = self.autoscaler.scaling_history if self.autoscaler else []
 
         cache_misses = cache_stats.get('cache_misses', 0)
+        cache_miss_recomputes = len(self.results['cache_miss_prefill_compute_latencies'])
         avg_context_tokens = (
             self.results['total_context_tokens'] / self.results['requests_completed']
             if self.results['requests_completed'] > 0 else 0
         )
-        prefill_compute_seconds_per_miss = avg_context_tokens * GENERATION_TIMING[self.generation_mode]
+        prefill_compute_seconds_per_miss = avg_context_tokens * self.prefill_seconds_per_token
         prefill_write_seconds_per_miss = (
-            float(np.mean(self.results['prefill_latencies']))
-            if self.results['prefill_latencies'] else 0.0
+            float(np.mean(self.results['cache_miss_write_latencies']))
+            if self.results['cache_miss_write_latencies']
+            else (float(np.mean(self.results['prefill_latencies'])) if self.results['prefill_latencies'] else 0.0)
         )
-        cache_miss_penalty_per_miss = prefill_compute_seconds_per_miss + prefill_write_seconds_per_miss
-        cache_miss_penalty_seconds = cache_misses * cache_miss_penalty_per_miss
-        adjusted_elapsed_time = duration + cache_miss_penalty_seconds
+        cache_miss_penalty_per_recompute = prefill_compute_seconds_per_miss + prefill_write_seconds_per_miss
+        cache_miss_write_seconds = sum(self.results['cache_miss_write_latencies'])
+        runtime_prefill_compute_seconds = self.results['total_cache_miss_prefill_compute_latency']
+        postprocessed_penalty_seconds = cache_miss_recomputes * cache_miss_penalty_per_recompute
+        unsimulated_prefill_compute_seconds = max(
+            0.0,
+            cache_miss_recomputes * prefill_compute_seconds_per_miss - runtime_prefill_compute_seconds,
+        )
+        adjusted_elapsed_time = duration + unsimulated_prefill_compute_seconds
         adjusted_throughput = (
             self.results['total_tokens_generated'] / adjusted_elapsed_time
             if adjusted_elapsed_time > 0 else 0
@@ -985,10 +1025,15 @@ class IntegratedBenchmark:
             'cache_miss_adjusted_seconds_per_token': adjusted_seconds_per_token,
             'cache_miss_penalty': {
                 'cache_misses': cache_misses,
-                'penalty_seconds': cache_miss_penalty_seconds,
-                'penalty_seconds_per_miss': cache_miss_penalty_per_miss,
+                'cache_miss_recomputes': cache_miss_recomputes,
+                'runtime_simulated': self.prefill_seconds_per_token > 0,
+                'penalty_seconds': postprocessed_penalty_seconds,
+                'penalty_seconds_per_miss': cache_miss_penalty_per_recompute,
                 'prefill_compute_seconds_per_miss': prefill_compute_seconds_per_miss,
                 'prefill_write_seconds_per_miss': prefill_write_seconds_per_miss,
+                'runtime_prefill_compute_seconds': runtime_prefill_compute_seconds,
+                'unsimulated_prefill_compute_seconds': unsimulated_prefill_compute_seconds,
+                'additional_write_seconds': cache_miss_write_seconds,
             },
             'total_storage_io_time': self.results['total_storage_io_latency'],
             'storage_throughput_tokens_per_sec': self.results['total_tokens_generated'] / self.results['total_storage_io_latency'] if self.results['total_storage_io_latency'] > 0 else 0,
@@ -1078,6 +1123,10 @@ class IntegratedBenchmark:
         print(f"Throughput (cache-miss adjusted): {summary['cache_miss_adjusted_throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"Throughput (storage I/O): {summary['storage_throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"Requests/sec: {summary['requests_per_second']:.2f}")
+        miss_penalty = summary.get('cache_miss_penalty', {})
+        print(f"Cache Misses: {miss_penalty.get('cache_misses', 0)} "
+              f"(recomputes: {miss_penalty.get('cache_miss_recomputes', 0)}, "
+              f"penalty: {miss_penalty.get('penalty_seconds', 0):.2f}s)")
 
         print(f"\n### END-TO-END LATENCY (Queue Wait + Storage I/O + Generation) ###")
         print(f"  Mean: {summary['end_to_end_latency_ms']['mean']:.2f} ms")
