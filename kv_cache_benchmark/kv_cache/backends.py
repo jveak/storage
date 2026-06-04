@@ -238,7 +238,7 @@ class NVMeBackend(StorageBackend):
     This is the third and slowest tier, used for offloading from CPU RAM.
     """
 
-    def __init__(self, base_path: str = None):
+    def __init__(self, base_path: str = None, clear_on_init: bool = False):
         self.temp_dir = None
         if base_path is None:
             self.temp_dir = tempfile.TemporaryDirectory(prefix="kv_cache_")
@@ -248,11 +248,12 @@ class NVMeBackend(StorageBackend):
             if self.base_path.exists():
                 if not self.base_path.is_dir():
                     raise NotADirectoryError(f"Cache path {self.base_path} exists but is not a directory.")
-                for entry in self.base_path.glob("*.npy"):
-                    try:
-                        entry.unlink()
-                    except OSError:
-                        pass
+                if clear_on_init:
+                    for entry in self.base_path.glob("*.npy"):
+                        try:
+                            entry.unlink()
+                        except OSError as exc:
+                            logger.warning(f"Could not remove existing cache file {entry}: {exc}")
             else:
                 self.base_path.mkdir(parents=True, exist_ok=True)
 

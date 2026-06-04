@@ -7,6 +7,7 @@ and MultiTierCache (3-tier LRU cache with waterfall eviction).
 
 import os
 import time
+import shutil
 import hashlib
 import logging
 import threading
@@ -105,7 +106,8 @@ class MultiTierCache:
                  seed: Optional[int] = None,
                  max_concurrent_allocs: int = 0,
                  storage_capacity_gb: float = 0,
-                 storage_cache_dir: str = None):
+                 storage_cache_dir: str = None,
+                 clean_cache_dir: bool = False):
 
         self.model_config = model_config
         self.gpu_memory_limit = gpu_memory_gb * 1024**3
@@ -128,9 +130,9 @@ class MultiTierCache:
             logger.warning(f"Could not initialize GPU backend: {e}")
 
         self.backends['cpu'] = CPUMemoryBackend()
-        self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
+        self.backends['nvme'] = NVMeBackend(base_path=cache_dir, clear_on_init=clean_cache_dir)
         if self.storage_cache_enabled:
-            self.backends['storage_cache'] = NVMeBackend(base_path=storage_cache_dir)
+            self.backends['storage_cache'] = NVMeBackend(base_path=storage_cache_dir, clear_on_init=clean_cache_dir)
 
         self.generator = KVCacheGenerator(model_config, global_seed=self.seed)
 
@@ -177,6 +179,7 @@ class MultiTierCache:
 
             'total_read_bytes': 0, 'total_write_bytes': 0,
             'read_operations': 0, 'write_operations': 0,
+            'storage_read_operations': 0, 'storage_write_operations': 0,
 
             'storage_tokens_processed': 0,
         }
@@ -192,7 +195,11 @@ class MultiTierCache:
             st = os.statvfs(str(base_path))
             return float(st.f_bavail * st.f_frsize) * 0.95
         except Exception:
-            return float('inf')
+            try:
+                usage = shutil.disk_usage(str(self.backends[tier].base_path))
+                return float(usage.free) * 0.95
+            except Exception:
+                return float('inf')
 
     def _is_storage_tier(self, tier: str) -> bool:
         """Return True for file-backed storage tiers."""
@@ -228,6 +235,11 @@ class MultiTierCache:
             if key not in self.entry_locks:
                 self.entry_locks[key] = threading.Lock()
             return self.entry_locks[key]
+
+    def contains(self, key: str) -> bool:
+        """Return True if the cache metadata currently tracks key."""
+        with self.metadata_lock:
+            return key in self.cache_entries
 
     def _handle_gpu_eviction(self, key: str, tier: str, evicted_size: int) -> None:
         """Callback invoked by GPUMemoryBackend when it evicts entries during OOM handling."""
@@ -659,6 +671,7 @@ class MultiTierCache:
                     self.stats['storage_write_device_latencies'].append(timing.device)
                     self.stats['storage_write_host_latencies'].append(timing.host)
                     self.stats['storage_tokens_processed'] += num_tokens
+                    self.stats['storage_write_operations'] += 1
                 elif allocated_tier == 'gpu':
                     self.stats['gpu_write_latencies'].append(timing.total)
 
@@ -670,6 +683,36 @@ class MultiTierCache:
                 self._update_tier_usage(allocated_tier, -size_bytes)
             del data
             return False, 'none', 0.0
+
+    def write_storage_entry(self, key: str, num_tokens: int, tier: str = 'nvme') -> Tuple[bool, int, float]:
+        """
+        Write a standalone preconditioning entry directly to a file-backed tier.
+
+        The entry is intentionally not added to cache_entries, so it cannot
+        become a benchmark cache hit after stats are reset.
+        """
+        if tier not in self.backends or not self._is_storage_tier(tier):
+            return False, 0, 0.0
+
+        try:
+            data = self.generator.generate(sequence_length=num_tokens, key=key)
+        except MemoryError:
+            logger.error(f"MemoryError generating preconditioning cache for key {key} ({num_tokens} tokens)")
+            return False, 0, 0.0
+        except Exception as exc:
+            logger.error(f"Failed to generate preconditioning cache for key {key}: {exc}")
+            return False, 0, 0.0
+
+        size_bytes = data.nbytes
+        try:
+            timing = self.backends[tier].write(key, data)
+        except Exception as exc:
+            logger.error(f"Failed to write preconditioning entry {key} to {tier}: {exc}")
+            del data
+            return False, 0, 0.0
+
+        del data
+        return True, size_bytes, timing.total
 
     def access_cache(self, key: str, phase: InferencePhase = InferencePhase.DECODE,
                      cache_type: str = 'user') -> Tuple[Optional[str], float]:
@@ -719,6 +762,8 @@ class MultiTierCache:
 
                 self.stats['read_operations'] += 1
                 self.stats['total_read_bytes'] += entry_size
+                if self._is_storage_tier(location):
+                    self.stats['storage_read_operations'] += 1
 
             try:
                 _, timing = self.backends[location].read(key)
@@ -749,6 +794,19 @@ class MultiTierCache:
         if self.performance_profile == 'throughput':
             read_bytes = self.stats.get('tier_storage_kv_bytes_read', 0)
             write_bytes = self.stats.get('tier_storage_kv_bytes_written', 0)
+            if read_bytes == 0 and write_bytes == 0:
+                return {
+                    'overall_status': 'NOT_APPLICABLE',
+                    'criteria': [{
+                        'name': 'Storage tier exercised',
+                        'target': '>0 storage bytes',
+                        'actual': '0 storage bytes',
+                        'unit': '',
+                        'passed': False
+                    }],
+                    'passed_count': 0,
+                    'total_count': 1
+                }
             read_bw_gbps = (read_bytes / 1024**3) / duration if duration > 0 else 0
             write_bw_gbps = (write_bytes / 1024**3) / duration if duration > 0 else 0
 
@@ -778,6 +836,24 @@ class MultiTierCache:
             }
 
         # Latency-focused profile (default)
+        storage_bytes = (
+            self.stats.get('tier_storage_kv_bytes_read', 0)
+            + self.stats.get('tier_storage_kv_bytes_written', 0)
+        )
+        if storage_bytes == 0:
+            return {
+                'overall_status': 'NOT_APPLICABLE',
+                'criteria': [{
+                    'name': 'Storage tier exercised',
+                    'target': '>0 storage bytes',
+                    'actual': '0 storage bytes',
+                    'unit': '',
+                    'passed': False
+                }],
+                'passed_count': 0,
+                'total_count': 1
+            }
+
         storage_write_device = self.stats.get('storage_write_device_latencies', [])
         storage_write_total = self.stats.get('storage_write_latencies', [])
         storage_write_basis = storage_write_device if storage_write_device else storage_write_total
@@ -890,6 +966,8 @@ class MultiTierCache:
             'tier_gpu_kv_bytes_read_gb': tier_gpu_read_bytes / 1024**3,
             'tier_cpu_kv_bytes_read_gb': tier_cpu_read_bytes / 1024**3,
             'tier_storage_kv_bytes_read_gb': tier_storage_read_bytes / 1024**3,
+            'tier_storage_kv_bytes_written': tier_storage_write_bytes,
+            'tier_storage_kv_bytes_read': tier_storage_read_bytes,
 
             'tier_gpu_read_bandwidth_gbps': (tier_gpu_read_bytes / 1024**3) / duration if duration > 0 else 0,
             'tier_gpu_write_bandwidth_gbps': (tier_gpu_write_bytes / 1024**3) / duration if duration > 0 else 0,
@@ -907,9 +985,16 @@ class MultiTierCache:
             'total_read_gb': self.stats['total_read_bytes'] / 1024**3,
             'total_write_gb': self.stats['total_write_bytes'] / 1024**3,
             'read_write_ratio': self.stats['total_read_bytes'] / max(self.stats['total_write_bytes'], 1),
-            'read_iops': self.stats['read_operations'],
-            'write_iops': self.stats['write_operations'],
+            'read_operations': self.stats['read_operations'],
+            'write_operations': self.stats['write_operations'],
+            'storage_read_operations': self.stats['storage_read_operations'],
+            'storage_write_operations': self.stats['storage_write_operations'],
+            'read_iops': self.stats['read_operations'] / duration if duration > 0 else 0,
+            'write_iops': self.stats['write_operations'] / duration if duration > 0 else 0,
+            'storage_read_iops': self.stats['storage_read_operations'] / duration if duration > 0 else 0,
+            'storage_write_iops': self.stats['storage_write_operations'] / duration if duration > 0 else 0,
             'storage_tokens_processed': self.stats['storage_tokens_processed'],
+            'storage_tokens_per_sec': self.stats['storage_tokens_processed'] / duration if duration > 0 else 0,
         }
 
        # tier_mapping = {'gpu': 'gpu', 'cpu': 'cpu', 'nvme': 'storage'}

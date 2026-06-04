@@ -80,6 +80,7 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Dataset Path': args.dataset_path or 'N/A',
         'Cache Dir': args.cache_dir or 'temp',
         'Storage Cache Dir': getattr(args, 'storage_cache_dir', None) or 'disabled',
+        'Force Clean Cache Dir': getattr(args, 'force_clean_cache_dir', False),
         'Storage Capacity (GB)': args.storage_capacity_gb,
         'Precondition': args.precondition,
         'Precondition Size (GB)': args.precondition_size_gb,
@@ -254,6 +255,8 @@ def main():
                         help='The directory to use for the disk/storage tier (TLC in dual-tier runs).')
     parser.add_argument('--storage-cache-dir', type=str, default=None,
                         help='Optional first storage tier (SLC). New storage writes try this tier before falling through to --cache-dir.')
+    parser.add_argument('--force-clean-cache-dir', action='store_true',
+                        help='Delete existing .npy files in cache directories before running.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
                         help='The token generation speed simulation mode.')
     parser.add_argument('--prefill-mode', type=str, default='none', choices=[g.value for g in GenerationMode],
@@ -392,7 +395,8 @@ def main():
         trace_speedup=args.trace_speedup,
         replay_cycles=args.replay_cycles,
         prefill_only=args.prefill_only,
-        decode_only=args.decode_only
+        decode_only=args.decode_only,
+        clean_cache_dir=args.force_clean_cache_dir
     )
 
     results = benchmark.run()

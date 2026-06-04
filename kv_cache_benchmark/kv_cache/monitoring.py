@@ -46,6 +46,8 @@ class StorageMonitor:
         self.last_collection_time = None
         self.last_total_read = 0
         self.last_total_write = 0
+        self.last_read_ops = 0
+        self.last_write_ops = 0
         self.metrics_history = []
         self.lock = threading.Lock()
 
@@ -54,8 +56,11 @@ class StorageMonitor:
         now = time.time()
         if self.last_collection_time is None:
             self.last_collection_time = now
-            self.last_total_read = cache.stats.get('total_read_bytes', 0)
-            self.last_total_write = cache.stats.get('total_write_bytes', 0)
+            stats = cache.get_stats(duration=self.benchmark_instance.duration)
+            self.last_total_read = stats.get('tier_storage_kv_bytes_read', 0)
+            self.last_total_write = stats.get('tier_storage_kv_bytes_written', 0)
+            self.last_read_ops = stats.get('storage_read_operations', 0)
+            self.last_write_ops = stats.get('storage_write_operations', 0)
             return {}
 
         elapsed = now - self.last_collection_time
@@ -63,19 +68,23 @@ class StorageMonitor:
             return {}
 
         stats = cache.get_stats(duration=self.benchmark_instance.duration)
-        current_total_read = stats.get('total_read_bytes', 0)
-        current_total_write = stats.get('total_write_bytes', 0)
+        current_total_read = stats.get('tier_storage_kv_bytes_read', 0)
+        current_total_write = stats.get('tier_storage_kv_bytes_written', 0)
+        current_read_ops = stats.get('storage_read_operations', 0)
+        current_write_ops = stats.get('storage_write_operations', 0)
 
         read_delta = max(current_total_read - self.last_total_read, 0)
         write_delta = max(current_total_write - self.last_total_write, 0)
+        read_ops_delta = max(current_read_ops - self.last_read_ops, 0)
+        write_ops_delta = max(current_write_ops - self.last_write_ops, 0)
 
         read_throughput = (read_delta / 1024**3) / elapsed
         write_throughput = (write_delta / 1024**3) / elapsed
 
         queue_depth = queue_size
 
-        read_iops = int((read_delta / 4096) / elapsed) if elapsed > 0 else 0
-        write_iops = int((write_delta / (16 * 1024)) / elapsed) if elapsed > 0 else 0
+        read_iops = int(read_ops_delta / elapsed) if elapsed > 0 else 0
+        write_iops = int(write_ops_delta / elapsed) if elapsed > 0 else 0
 
         read_latency_p95_ms = stats.get('storage_read_p95_ms', 0.0)
         write_latency_p95_ms = stats.get('storage_write_p95_ms', 0.0)
@@ -122,6 +131,8 @@ class StorageMonitor:
         self.last_collection_time = now
         self.last_total_read = current_total_read
         self.last_total_write = current_total_write
+        self.last_read_ops = current_read_ops
+        self.last_write_ops = current_write_ops
         return metrics
 
     def get_saturation_level(self) -> float:

@@ -124,6 +124,30 @@ FORBIDDEN_CACHE_PREFIXES = frozenset([
     '/boot', '/sys', '/proc', '/dev', '/root'
 ])
 
+FORBIDDEN_WINDOWS_PATH_PARTS = frozenset([
+    'windows', 'program files', 'program files (x86)', 'programdata'
+])
+
+
+def _is_forbidden_cache_path(cache_path: Path) -> bool:
+    """Return True for roots and common system directories."""
+    resolved = cache_path.resolve()
+    normalized = str(resolved).replace('\\', '/').lower().rstrip('/')
+
+    if str(resolved) == resolved.anchor:
+        return True
+
+    for prefix in FORBIDDEN_CACHE_PREFIXES:
+        prefix_norm = prefix.rstrip('/').lower()
+        if normalized == prefix_norm or normalized.startswith(prefix_norm + '/'):
+            return True
+
+    parts = [part.lower() for part in resolved.parts]
+    if any(part in FORBIDDEN_WINDOWS_PATH_PARTS for part in parts):
+        return True
+
+    return False
+
 
 def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     """
@@ -199,12 +223,8 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     ):
         if dir_arg:
             cache_path = Path(dir_arg).resolve()
-            cache_path_str = str(cache_path)
-
-            for prefix in FORBIDDEN_CACHE_PREFIXES:
-                if cache_path_str.startswith(prefix):
-                    errors.append(f"{label} cannot be a system directory: {cache_path}")
-                    break
+            if _is_forbidden_cache_path(cache_path):
+                errors.append(f"{label} cannot be a system directory or filesystem root: {cache_path}")
 
             parent = cache_path.parent
             if parent.exists() and not os.access(parent, os.W_OK):

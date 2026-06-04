@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 
 from kv_cache.config import cfg
-from kv_cache.models import ModelConfig, InferenceRequest
+from kv_cache.models import ModelConfig, InferencePhase, InferenceRequest
 
 
 class PrefixType(Enum):
@@ -108,26 +108,47 @@ class PrefixCacheManager:
             'bytes_saved': 0
         }
 
-    def check_prefix_cache(self, request: InferenceRequest, model_config: ModelConfig) -> Tuple[Optional[PrefixCacheEntry], int]:
+    def check_prefix_cache(self, request: InferenceRequest, model_config: ModelConfig) -> Tuple[Optional[PrefixCacheEntry], int, Optional[str]]:
         """
         Checks if the beginning of a request matches a known, cached prefix.
 
         Returns:
-            A tuple containing the PrefixCacheEntry if a hit occurs (or None),
-            and the number of remaining (non-prefixed) tokens in the request.
+            A tuple containing the PrefixCacheEntry only when the KV entry is
+            already reusable, the number of remaining non-prefixed tokens, and
+            the cache_type label to use for the prefix read.
         """
         prefix_entry = self.prefix_matcher.detect_system_prompt(request.context_tokens)
 
-        if prefix_entry:
-            with self.lock:
-                self.stats['prefix_hits'] += 1
-                if prefix_entry.prefix_type == PrefixType.SYSTEM_PROMPT:
-                    self.stats['system_prompt_reuse'] += 1
-                self.stats['bytes_saved'] += prefix_entry.token_count * model_config.kv_cache_size_per_token
-
-            remaining_tokens = max(0, request.context_tokens - prefix_entry.token_count)
-            return prefix_entry, remaining_tokens
-        else:
+        if not prefix_entry:
             with self.lock:
                 self.stats['prefix_misses'] += 1
-            return None, request.context_tokens
+            return None, request.context_tokens, None
+
+        if not self.cache.contains(prefix_entry.kv_cache_key):
+            success, location, _ = self.cache.allocate_cache(
+                prefix_entry.kv_cache_key,
+                prefix_entry.token_count,
+                InferencePhase.PREFILL,
+                request.qos_level
+            )
+            if success:
+                prefix_entry.storage_tier = location
+                prefix_entry.size_bytes = prefix_entry.token_count * model_config.kv_cache_size_per_token
+
+            with self.lock:
+                self.stats['prefix_misses'] += 1
+            return None, request.context_tokens, None
+
+        cache_type = 'system' if prefix_entry.prefix_type == PrefixType.SYSTEM_PROMPT else 'common'
+        remaining_tokens = max(0, request.context_tokens - prefix_entry.token_count)
+        return prefix_entry, remaining_tokens, cache_type
+
+    def record_prefix_hit(self, prefix_entry: PrefixCacheEntry, model_config: ModelConfig):
+        """Record a prefix hit after the underlying KV cache read succeeds."""
+        with self.lock:
+            self.stats['prefix_hits'] += 1
+            if prefix_entry.prefix_type == PrefixType.SYSTEM_PROMPT:
+                self.stats['system_prompt_reuse'] += 1
+            elif prefix_entry.prefix_type == PrefixType.COMMON_PHRASE:
+                self.stats['common_phrase_reuse'] += 1
+            self.stats['bytes_saved'] += prefix_entry.token_count * model_config.kv_cache_size_per_token

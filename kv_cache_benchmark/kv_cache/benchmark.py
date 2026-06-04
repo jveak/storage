@@ -28,7 +28,7 @@ from kv_cache.models import (
 )
 from kv_cache.cache import MultiTierCache
 from kv_cache.conversation import ConversationManager
-from kv_cache.prefix_cache import PrefixType, PrefixCacheManager
+from kv_cache.prefix_cache import PrefixCacheManager
 from kv_cache.rag import RAGDocumentManager
 from kv_cache.monitoring import StorageMonitor, WorkloadAutoscaler, QoSMonitor
 from kv_cache.workload import (
@@ -81,7 +81,8 @@ class IntegratedBenchmark:
                  trace_speedup: float = 1.0,
                  replay_cycles: int = 0,
                  prefill_only: bool = False,
-                 decode_only: bool = False):
+                 decode_only: bool = False,
+                 clean_cache_dir: bool = False):
 
         self.model_config = model_config
         self.num_users = num_users
@@ -119,8 +120,13 @@ class IntegratedBenchmark:
         self.replay_cycles = replay_cycles
         self.prefill_only = prefill_only
         self.decode_only = decode_only
+        self.clean_cache_dir = clean_cache_dir
         self.burst_trace_files: List[str] = []
         self.sharegpt_loader: Optional[ShareGPTDatasetLoader] = None
+        self.user_thread_lock = threading.Lock()
+        self.user_threads: Dict[str, threading.Thread] = {}
+        self.user_stop_events: Dict[str, threading.Event] = {}
+        self.synthetic_user_index = 0
 
         if self.dataset_path:
             self.sharegpt_loader = ShareGPTDatasetLoader(
@@ -145,7 +151,8 @@ class IntegratedBenchmark:
             seed=seed,
             max_concurrent_allocs=max_concurrent_allocs,
             storage_capacity_gb=storage_capacity_gb,
-            storage_cache_dir=storage_cache_dir
+            storage_cache_dir=storage_cache_dir,
+            clean_cache_dir=clean_cache_dir
         )
         self.conversation_manager = ConversationManager()
         self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None
@@ -425,13 +432,13 @@ class IntegratedBenchmark:
             priority_tuple = (-QOS_PROFILES[request.qos_level].priority, time.time())
             self.request_queue.put((priority_tuple, request))
 
-        def user_worker(user: UserProfile):
+        def user_worker(user: UserProfile, user_stop_event: threading.Event):
             """Simulates an individual user generating traffic."""
             local_conv_id = None
 
-            while not stop_event.is_set():
+            while not stop_event.is_set() and not user_stop_event.is_set():
                 time.sleep(user.think_time * random.uniform(0.8, 1.2))
-                if stop_event.is_set():
+                if stop_event.is_set() or user_stop_event.is_set():
                     break
 
                 if self.enable_multi_turn and self.conversation_manager:
@@ -503,12 +510,62 @@ class IntegratedBenchmark:
                     )
                     enqueue_request(rag_request)
 
-        for user in users:
-            threading.Thread(target=user_worker, args=(user,), daemon=True).start()
+            with self.user_conversations_lock:
+                self.user_conversations.pop(user.user_id, None)
 
-        self.active_users = users
+        def make_user(index: int) -> UserProfile:
+            if index < len(users):
+                return users[index]
+            user = UserSimulator.generate_mixed_users(1)[0]
+            user.user_id = f"user_{index:04d}"
+            return user
 
-        stop_event.wait()
+        def start_user(user: UserProfile):
+            user_stop_event = threading.Event()
+            thread = threading.Thread(target=user_worker, args=(user, user_stop_event), daemon=True)
+            with self.user_thread_lock:
+                self.user_stop_events[user.user_id] = user_stop_event
+                self.user_threads[user.user_id] = thread
+                self.active_users.append(user)
+            thread.start()
+
+        try:
+            while not stop_event.is_set():
+                with self.user_thread_lock:
+                    active_count = len(self.active_users)
+
+                while active_count < self.num_users and not stop_event.is_set():
+                    user = make_user(self.synthetic_user_index)
+                    self.synthetic_user_index += 1
+                    start_user(user)
+                    active_count += 1
+
+                while active_count > self.num_users and not stop_event.is_set():
+                    with self.user_thread_lock:
+                        user = self.active_users.pop()
+                        user_stop_event = self.user_stop_events.pop(user.user_id, None)
+                    if user_stop_event:
+                        user_stop_event.set()
+                    active_count -= 1
+
+                time.sleep(0.25)
+        finally:
+            with self.user_thread_lock:
+                stop_events = list(self.user_stop_events.values())
+                threads = list(self.user_threads.values())
+                self.user_stop_events.clear()
+                self.user_threads.clear()
+                self.active_users = []
+
+            for user_stop_event in stop_events:
+                user_stop_event.set()
+            for thread in threads:
+                thread.join(timeout=1.0)
+
+    def _active_user_count(self) -> int:
+        """Return the number of live synthetic user generators."""
+        with self.user_thread_lock:
+            return len(self.active_users)
 
     def _wait_for_prior_turn(self, request: InferenceRequest, stop_event: threading.Event) -> bool:
         """Block a conversation turn until the previous turn has finished writing."""
@@ -563,16 +620,21 @@ class IntegratedBenchmark:
 
             request.start_time = time.perf_counter()
             storage_latency = 0.0
-            cache_type = 'user'
+            main_cache_type = 'user'
 
             # 1. Check for a prefix cache hit.
             if self.prefix_cache_manager:
-                prefix_entry, remaining_tokens = self.prefix_cache_manager.check_prefix_cache(request, self.model_config)
+                prefix_entry, remaining_tokens, prefix_cache_type = self.prefix_cache_manager.check_prefix_cache(request, self.model_config)
                 if prefix_entry:
-                    cache_type = 'system' if prefix_entry.prefix_type == PrefixType.SYSTEM_PROMPT else 'common'
-                    _, read_lat = self.cache.access_cache(prefix_entry.kv_cache_key, request.phase, cache_type)
-                    storage_latency += read_lat
-                    request.context_tokens = remaining_tokens
+                    location, read_lat = self.cache.access_cache(
+                        prefix_entry.kv_cache_key,
+                        InferencePhase.DECODE,
+                        prefix_cache_type
+                    )
+                    if location is not None:
+                        storage_latency += read_lat
+                        request.context_tokens = remaining_tokens
+                        self.prefix_cache_manager.record_prefix_hit(prefix_entry, self.model_config)
 
             # 2. For multi-turn conversations, access cache from previous turn.
             if self.conversation_manager and request.turn_number > 1:
@@ -615,7 +677,7 @@ class IntegratedBenchmark:
                     else:
                         decode_key = request.cache_key
                     
-                    location, read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
+                    location, read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, main_cache_type)
 
                     if location is None:
                         # Cache miss during decode - need to allocate (unless decode_only)
@@ -635,7 +697,7 @@ class IntegratedBenchmark:
                         num_batched_reads = max(1, (request.generate_tokens + decode_batch_size - 1) // decode_batch_size)
                         storage_latency += read_latency
                         for _ in range(num_batched_reads - 1):
-                            _, batch_read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
+                            _, batch_read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, main_cache_type)
                             storage_latency += batch_read_latency
 
                     with self.results_lock: self.results['decode_latencies'].append(read_latency)
@@ -701,18 +763,22 @@ class IntegratedBenchmark:
                 if action in ('scale_up', 'scale_down') and target_users != self.num_users:
                     self.num_users = max(1, min(target_users, 500))
                     self.autoscaler.current_users = self.num_users
+                    actual_users = self._active_user_count()
                     log_entry = {
                         'timestamp': datetime.now().isoformat(),
                         'mode': self.autoscaler.mode,
                         'action': action,
-                        'users': self.num_users,
+                        'target_users': self.num_users,
+                        'actual_active_users': actual_users,
+                        'worker_threads': getattr(self, 'worker_thread_count', None),
                         'saturation_level': saturation_level,
                         'read_latency_p95_ms': metrics.read_latency_p95_ms if metrics else None,
                         'write_latency_p95_ms': metrics.write_latency_p95_ms if metrics else None,
                         'throughput_tokens_per_sec': throughput
                     }
                     self.autoscaler.scaling_history.append(log_entry)
-                    logger.info(f"Autoscaler {action} -> {self.num_users} users (saturation: {saturation_level:.2f})")
+                    logger.info(f"Autoscaler {action} -> target {self.num_users} users "
+                                f"(active: {actual_users}, saturation: {saturation_level:.2f})")
                 elif action == 'stop':
                     logger.info("Autoscaler requested stop after reaching capacity peak.")
                     stop_event.set()
@@ -720,7 +786,9 @@ class IntegratedBenchmark:
                         'timestamp': datetime.now().isoformat(),
                         'mode': self.autoscaler.mode,
                         'action': 'stop',
-                        'users': self.num_users,
+                        'target_users': self.num_users,
+                        'actual_active_users': self._active_user_count(),
+                        'worker_threads': getattr(self, 'worker_thread_count', None),
                         'saturation_level': saturation_level,
                         'peak_throughput_tokens_per_sec': self.autoscaler.peak_throughput
                     }
@@ -812,7 +880,8 @@ class IntegratedBenchmark:
         threads.append(gen_thread)
         gen_thread.start()
 
-        num_workers = min(self.num_users, 500)
+        num_workers = 500 if self.enable_autoscaling else min(self.num_users, 500)
+        self.worker_thread_count = num_workers
         for _ in range(num_workers):
             proc_thread = threading.Thread(target=self.process_requests, args=(stop_event,), daemon=True)
             threads.append(proc_thread)
@@ -854,10 +923,13 @@ class IntegratedBenchmark:
         print(f"\n### PRECONDITIONING PHASE ###")
         print(f"  Target: {target_gb:.1f} GB")
         print(f"  Threads: {num_threads}")
+        print("  Target tier: nvme")
+        print(f"  Target path: {self.cache.backends['nvme'].base_path}")
 
-        tokens_per_entry = 2048
+        bytes_per_token = max(self.model_config.kv_cache_size_per_token, 1)
+        tokens_per_entry = max(1, min(2048, int(target_bytes // bytes_per_token) or 1))
         lock = threading.Lock()
-        state = {'written_bytes': 0, 'seq': 0, 'last_report': 0}
+        state = {'written_bytes': 0, 'files_written': 0, 'seq': 0, 'last_report': 0}
 
         def worker():
             consecutive_failures = 0
@@ -869,18 +941,17 @@ class IntegratedBenchmark:
                     state['seq'] += 1
 
                 key = f"precond_{my_seq}"
-                success, tier, latency = self.cache.allocate_cache(key, tokens_per_entry)
+                success, written_bytes, _ = self.cache.write_storage_entry(key, tokens_per_entry, tier='nvme')
 
                 if success:
                     consecutive_failures = 0
-                    entry = self.cache.cache_entries.get(key)
-                    if entry:
-                        with lock:
-                            state['written_bytes'] += entry['size']
-                            gb_written = state['written_bytes'] / 1024**3
-                            if gb_written - state['last_report'] >= 10:
-                                print(f"  Preconditioning progress: {gb_written:.1f} / {target_gb:.1f} GB")
-                                state['last_report'] = gb_written
+                    with lock:
+                        state['written_bytes'] += written_bytes
+                        state['files_written'] += 1
+                        gb_written = state['written_bytes'] / 1024**3
+                        if gb_written - state['last_report'] >= 10:
+                            print(f"  Preconditioning progress: {gb_written:.1f} / {target_gb:.1f} GB")
+                            state['last_report'] = gb_written
                 else:
                     consecutive_failures += 1
                     if consecutive_failures > 50:
@@ -894,7 +965,11 @@ class IntegratedBenchmark:
             for f in futures:
                 f.result()
 
+        if self.storage_capacity_gb == 0:
+            self.cache.nvme_memory_limit = self.cache._resolve_storage_limit('nvme', 0)
+
         print(f"  Preconditioning complete: {state['written_bytes'] / 1024**3:.1f} GB written")
+        print(f"  Files written: {state['files_written']}")
         print(f"  Resetting stats for steady-state measurement...")
         self.cache.reset_stats()
 
@@ -970,6 +1045,10 @@ class IntegratedBenchmark:
         qos_metrics = self.qos_monitor.get_all_qos_metrics()
         prefix_stats = self.prefix_cache_manager.stats if self.prefix_cache_manager else {}
         autoscaling_stats = self.autoscaler.scaling_history if self.autoscaler else []
+        io_latency_normalized_throughput = (
+            self.results['total_tokens_generated'] / self.results['total_storage_io_latency']
+            if self.results['total_storage_io_latency'] > 0 else 0
+        )
 
         cache_misses = cache_stats.get('cache_misses', 0)
         cache_miss_recomputes = len(self.results['cache_miss_prefill_compute_latencies'])
@@ -1006,6 +1085,8 @@ class IntegratedBenchmark:
             autoscaling_summary = {
                 'initial_users': getattr(self, 'initial_users', self.num_users),
                 'final_users': self.autoscaler.current_users,
+                'actual_active_users': self._active_user_count(),
+                'worker_threads': getattr(self, 'worker_thread_count', None),
                 'total_scale_events': len(autoscaling_stats)
             }
             if self.autoscaler.mode == 'capacity':
@@ -1036,7 +1117,8 @@ class IntegratedBenchmark:
                 'additional_write_seconds': cache_miss_write_seconds,
             },
             'total_storage_io_time': self.results['total_storage_io_latency'],
-            'storage_throughput_tokens_per_sec': self.results['total_tokens_generated'] / self.results['total_storage_io_latency'] if self.results['total_storage_io_latency'] > 0 else 0,
+            'storage_throughput_tokens_per_sec': cache_stats.get('storage_tokens_per_sec', 0),
+            'io_latency_normalized_tokens_per_sec': io_latency_normalized_throughput,
             'requests_per_second': self.results['requests_completed'] / duration,
             'end_to_end_latency_ms': {
                 'mean': np.mean(e2e) * 1000,
@@ -1121,7 +1203,8 @@ class IntegratedBenchmark:
         print(f"Total Tokens Generated: {summary['total_tokens']}")
         print(f"Throughput (wall-clock): {summary['avg_throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"Throughput (cache-miss adjusted): {summary['cache_miss_adjusted_throughput_tokens_per_sec']:.2f} tokens/sec")
-        print(f"Throughput (storage I/O): {summary['storage_throughput_tokens_per_sec']:.2f} tokens/sec")
+        print(f"Throughput (storage tokens): {summary['storage_throughput_tokens_per_sec']:.2f} tokens/sec")
+        print(f"Throughput (I/O-latency normalized): {summary['io_latency_normalized_tokens_per_sec']:.2f} tokens/sec")
         print(f"Requests/sec: {summary['requests_per_second']:.2f}")
         miss_penalty = summary.get('cache_miss_penalty', {})
         print(f"Cache Misses: {miss_penalty.get('cache_misses', 0)} "
@@ -1158,8 +1241,13 @@ class IntegratedBenchmark:
             print(f"  Read/Write Ratio: 0 (write-only)")
         else:
             print(f"  Read/Write Ratio: {rw_ratio:.2f}")
-        print(f"  Storage KV Read Operations/sec: {cache_stats['read_iops'] / self.duration:.2f}")
-        print(f"  Storage KV Write Operations/sec: {cache_stats['write_iops'] / self.duration:.2f}")
+        print(f"  KV Read Operations: {cache_stats['read_operations']}")
+        print(f"  KV Write Operations: {cache_stats['write_operations']}")
+        print(f"  KV Read Operations/sec: {cache_stats['read_iops']:.2f}")
+        print(f"  KV Write Operations/sec: {cache_stats['write_iops']:.2f}")
+        if cache_stats.get('storage_read_operations', 0) or cache_stats.get('storage_write_operations', 0):
+            print(f"  Storage KV Read Operations/sec: {cache_stats['storage_read_iops']:.2f}")
+            print(f"  Storage KV Write Operations/sec: {cache_stats['storage_write_iops']:.2f}")
 
         print(f"\n### CACHE TIER DISTRIBUTION ###")
         print(f"  GPU Entries: {cache_stats['gpu_entries']} ({cache_stats['gpu_memory_used_gb']:.2f} GB)")
